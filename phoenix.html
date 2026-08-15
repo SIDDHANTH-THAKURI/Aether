@@ -914,6 +914,14 @@ function kick(amp, caAmt, flashAmt, col) {
 const rnd = (a, b) => a + Math.random() * (b - a);
 const SC = () => Math.max(W, Hh) / 1400;            // sizes stay consistent at any resolution
 
+// ---- 0. back to IDLE (lost tracking, spark timed out, or dropped the hold) --
+function reset(h) {
+  h.state = 'IDLE';
+  h.sparkAge = 0;
+  h.hold = 0;
+  h.maxAnnounced = false;
+}
+
 // ---- 1. SNAP → SPARK ------------------------------------------------------
 function ignite(h) {
   h.state = 'SPARK';
