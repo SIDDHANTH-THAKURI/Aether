@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kamehameha — Live Hand Tracking</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#000; overflow:hidden; }
+  canvas { display:block; position:fixed; inset:0; width:100%; height:100%; }
+  video { position:fixed; opacity:0; pointer-events:none; width:1px; height:1px; }
+
+  #hud {
+    position:fixed; left:3vh; bottom:3vh;
+    font:300 clamp(11px,1.5vh,17px)/1.8 system-ui,-apple-system,"Segoe UI",sans-serif;
+    color:rgba(255,255,255,0.6); letter-spacing:.12em; text-transform:uppercase;
+    pointer-events:none; transition:opacity .8s ease; text-shadow:0 0 12px rgba(0,0,0,.9);
+  }
+  #hud.hidden { opacity:0; }
+  #hud b { color:#7fdcff; font-weight:500; }
+
+  #status {
+    position:fixed; left:50%; top:4vh; transform:translateX(-50%);
+    font:300 clamp(12px,2vh,22px)/1.4 system-ui,sans-serif;
+    color:rgba(255,255,255,.75); letter-spacing:.45em; text-transform:uppercase;
+    pointer-events:none; text-shadow:0 0 20px rgba(0,180,255,.8);
+    transition:opacity .4s ease;
+  }
+
+  #boot {
+    position:fixed; inset:0; display:grid; place-content:center; text-align:center;
+    font:300 clamp(13px,1.9vh,20px)/1.9 system-ui,sans-serif; color:#cfe6ff;
+    padding:10vh 8vw; background:#000; z-index:10; transition:opacity .8s ease;
+  }
+  #boot.gone { opacity:0; pointer-events:none; }
+  #boot small { color:#7f93ad; display:block; margin-top:2.5vh; letter-spacing:.1em; }
+  #boot .err { color:#ff8080; font-family:ui-monospace,Consolas,monospace; font-size:.85em; }
+</style>
+</head>
+<body>
+
+<video id="cam" playsinline muted></video>
+<canvas id="c"></canvas>
+
+<div id="status"></div>
+<div id="hud">
+  <b>Both hands together</b> at your side to charge &nbsp;·&nbsp;
+  <b>Thrust forward</b> to fire<br />
+  <b>F</b> fullscreen &nbsp;·&nbsp; <b>H</b> hide text &nbsp;·&nbsp;
+  <b>D</b> debug skeleton &nbsp;·&nbsp; <b>C</b> camera view
+</div>
+
+<div id="boot">
+  Loading hand tracking model…
+  <small>Allow camera access when prompted.</small>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---------------------------------------------------------------- tuning
+const CHARGE_DIST   = 2.6;   // palms closer than this * handScale counts as cupped
+const CHARGE_RATE   = 0.42;  // charge gained per second while cupped
+const MIN_FIRE      = 0.14;  // charge needed before a release will fire
+const SEP_FIRE      = 2.2;   // palm separation speed (scale/sec) that triggers release
+const PUSH_FIRE     = 1.5;   // hand-growth speed (toward camera) that triggers release
+const DECAY         = 0.55;  // charge lost per second when hands break apart slowly
+const BEAM_LIFE     = 1.5;   // seconds a fired beam stays on screen
+
+// ---------------------------------------------------------------- state
+const video  = document.getElementById('cam');
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const boot   = document.getElementById('boot');
+const statusEl = document.getElementById('status');
+
+let landmarker = null;
+let lastVideoTime = -1;
+let hands = [];              // current frame landmarks
+
+let charge   = 0;            // 0..1
+let state    = 'IDLE';       // IDLE | CHARGING | FIRING
+let orb      = { x: 0, y: 0, has: false };
+let orbSmooth= { x: 0, y: 0 };
+let prevSep  = null;
+let prevScale= null;
+let sepVel   = 0;
+let pushVel  = 0;
+let orbHist  = [];           // recent orb positions, for aim direction
+
+let beams = [];
+let particles = [];
+let rings = [];
+let flash = 0;
+let shake = 0;
+
+let showDebug = false;
+let showCam = true;
+let dpr = 1;
+let last = performance.now();
+
+// ---------------------------------------------------------------- helpers
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// Palm centre from the five knuckle/wrist anchors — steadier than any one point.
+function palmCenter(lm) {
+  const ids = [0, 5, 9, 13, 17];
+  let x = 0, y = 0;
+  for (const i of ids) { x += lm[i].x; y += lm[i].y; }
+  return { x: x / ids.length, y: y / ids.length };
+}
+
+// Wrist→middle-knuckle length: the hand's own scale, so thresholds stay
+// distance-independent (bigger on screen = closer to camera).
+const handScale = lm => dist(lm[0], lm[9]);
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width  = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+}
+
+// ---------------------------------------------------------------- boot
+async function start() {
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    landmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    resize();
+    addEventListener('resize', resize);
+    addEventListener('keydown', onKey);
+
+    boot.classList.add('gone');
+    requestAnimationFrame(loop);
+  } catch (e) {
+    console.error(e);
+    boot.innerHTML =
+      'Could not start.<br /><span class="err">' + (e && e.message ? e.message : e) + '</span>' +
+      '<small>Camera needs http://localhost (not a file:// path) and permission granted.</small>';
+  }
+}
+
+// ---------------------------------------------------------------- tracking
+function track(dt) {
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    hands = res.landmarks || [];
+  }
+
+  orb.has = false;
+
+  if (hands.length >= 2) {
+    const a = palmCenter(hands[0]);
+    const b = palmCenter(hands[1]);
+    const scale = (handScale(hands[0]) + handScale(hands[1])) * 0.5;
+    const sep = dist(a, b) / Math.max(scale, 1e-4);   // separation in hand-widths
+
+    // Mirror x so the scene matches a mirror image of the user.
+    orb.x = (1 - (a.x + b.x) * 0.5) * canvas.width;
+    orb.y = ((a.y + b.y) * 0.5) * canvas.height;
+    orb.has = true;
+
+    sepVel  = prevSep   === null ? 0 : (sep - prevSep) / Math.max(dt, 1e-3);
+    pushVel = prevScale === null ? 0 : (scale - prevScale) / Math.max(dt, 1e-3) / Math.max(scale, 1e-4);
+    prevSep = sep;
+    prevScale = scale;
+
+    if (sep < CHARGE_DIST) {
+      if (state !== 'FIRING') state = 'CHARGING';
+      charge = clamp(charge + CHARGE_RATE * dt, 0, 1);
+    } else if (state === 'CHARGING') {
+      // Hands opened: a fast break is a release, a slow drift just bleeds charge.
+      if (charge >= MIN_FIRE && (sepVel > SEP_FIRE || pushVel > PUSH_FIRE)) fire();
+      else {
+        charge = clamp(charge - DECAY * dt, 0, 1);
+        if (charge <= 0.001) state = 'IDLE';
+      }
+    }
+
+    // A thrust straight at the camera also fires, even if hands stay together.
+    if (state === 'CHARGING' && charge >= MIN_FIRE && pushVel > PUSH_FIRE) fire();
+
+  } else {
+    prevSep = prevScale = null;
+    if (state === 'CHARGING') {
+      // Hands left the frame mid-charge — treat a big charge as a release.
+      if (charge >= MIN_FIRE * 2.4) fire();
+      else { charge = clamp(charge - DECAY * 1.6 * dt, 0, 1); if (charge <= 0) state = 'IDLE'; }
+    }
+  }
+
+  if (orb.has) {
+    const k = 1 - Math.pow(0.001, dt);           // frame-rate independent smoothing
+    orbSmooth.x = orbSmooth.x ? lerp(orbSmooth.x, orb.x, k) : orb.x;
+    orbSmooth.y = orbSmooth.y ? lerp(orbSmooth.y, orb.y, k) : orb.y;
+    orbHist.push({ x: orbSmooth.x, y: orbSmooth.y, t: performance.now() });
+    if (orbHist.length > 12) orbHist.shift();
+  }
+}
+
+// ---------------------------------------------------------------- fire
+function fire() {
+  const power = charge;
+  state = 'FIRING';
+
+  // Aim from how the orb was travelling over the last few frames.
+  let dx = 0, dy = 0;
+  if (orbHist.length >= 4) {
+    const a = orbHist[0], b = orbHist[orbHist.length - 1];
+    dx = b.x - a.x; dy = b.y - a.y;
+  }
+  const mag = Math.hypot(dx, dy);
+  const forward = mag < canvas.width * 0.02;      // no lateral motion = straight at camera
+
+  if (!forward) { dx /= mag; dy /= mag; }
+  else { dx = 0; dy = 0; }
+
+  beams.push({
+    x: orbSmooth.x, y: orbSmooth.y,
+    dx, dy, forward,
+    power, life: BEAM_LIFE * (0.6 + power * 0.7), age: 0,
+  });
+
+  rings.push({ x: orbSmooth.x, y: orbSmooth.y, r: 20 * dpr, life: 0.9, age: 0, power });
+  flash = 0.55 + power * 0.45;
+  shake = 14 * dpr * (0.4 + power);
+
+  // Blow the charge particles outward
+  const n = Math.floor(60 + power * 220);
+  for (let i = 0; i < n; i++) {
+    const ang = forward ? Math.random() * Math.PI * 2
+                        : Math.atan2(dy, dx) + (Math.random() - 0.5) * 1.5;
+    const sp = (200 + Math.random() * 900) * dpr * (0.4 + power);
+    particles.push({
+      x: orbSmooth.x, y: orbSmooth.y,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp,
+      life: 0.4 + Math.random() * 0.7, age: 0,
+      size: (1.5 + Math.random() * 3.5) * dpr, hue: 190 + Math.random() * 40,
+    });
+  }
+
+  charge = 0;
+  setTimeout(() => { if (state === 'FIRING') state = 'IDLE'; }, 700);
+}
+
+// ---------------------------------------------------------------- charge particles
+function spawnCharge(dt) {
+  if (!orb.has || charge <= 0.02) return;
+  const n = Math.floor(charge * 9 + 2);
+  for (let i = 0; i < n; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const r = (140 + Math.random() * 260) * dpr * (0.5 + charge);
+    particles.push({
+      x: orbSmooth.x + Math.cos(ang) * r,
+      y: orbSmooth.y + Math.sin(ang) * r,
+      vx: 0, vy: 0, inward: true, orbit: ang,
+      radius: r, life: 0.5 + Math.random() * 0.5, age: 0,
+      size: (1 + Math.random() * 2.6) * dpr, hue: 185 + Math.random() * 45,
+    });
+  }
+}
+
+// ---------------------------------------------------------------- render
+function draw(dt, now) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (shake > 0.2) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake *= Math.pow(0.02, dt);
+  }
+
+  // --- camera feed, mirrored and dimmed so the effects stay dominant
+  if (showCam && video.readyState >= 2) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.max(canvas.width / vw, canvas.height / vh);
+    const w = vw * s, h = vh * s;
+    ctx.save();
+    ctx.globalAlpha = 0.42;
+    ctx.translate(canvas.width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+    ctx.restore();
+    ctx.fillStyle = 'rgba(2,6,16,0.55)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  } else {
+    ctx.fillStyle = '#02060f';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  ctx.globalCompositeOperation = 'lighter';
+
+  drawParticles(dt);
+  if (charge > 0.02 && orb.has && state !== 'FIRING') drawOrb(now);
+  drawBeams(dt);
+  drawRings(dt);
+
+  ctx.globalCompositeOperation = 'source-over';
+  if (showDebug) drawSkeleton();
+
+  if (flash > 0.01) {
+    ctx.fillStyle = `rgba(220,245,255,${flash})`;
+    ctx.fillRect(-50, -50, canvas.width + 100, canvas.height + 100);
+    flash *= Math.pow(0.004, dt);
+  }
+
+  drawMeter();
+}
+
+function drawOrb(now) {
+  const t = now * 0.001;
+  const base = (28 + charge * 130) * dpr;
+  const pulse = 1 + Math.sin(t * 14) * 0.05 * charge + Math.sin(t * 31) * 0.02;
+  const r = base * pulse;
+  const x = orbSmooth.x, y = orbSmooth.y;
+
+  // outer bloom
+  let g = ctx.createRadialGradient(x, y, 0, x, y, r * 3.2);
+  g.addColorStop(0,   `rgba(150,235,255,${0.30 + charge * 0.35})`);
+  g.addColorStop(0.35,`rgba(40,150,255,${0.16 + charge * 0.20})`);
+  g.addColorStop(1,   'rgba(0,60,180,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r * 3.2, 0, Math.PI * 2); ctx.fill();
+
+  // core
+  g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0,   'rgba(255,255,255,1)');
+  g.addColorStop(0.4, `rgba(190,245,255,${0.85})`);
+  g.addColorStop(0.75,`rgba(60,175,255,${0.55})`);
+  g.addColorStop(1,   'rgba(20,90,220,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+
+  // arcs of electricity, more of them the fuller the charge
+  const arcs = Math.floor(charge * 7);
+  ctx.lineWidth = 1.6 * dpr;
+  for (let i = 0; i < arcs; i++) {
+    ctx.strokeStyle = `rgba(200,245,255,${0.25 + Math.random() * 0.5})`;
+    ctx.beginPath();
+    let a = Math.random() * Math.PI * 2;
+    let rr = r * (0.9 + Math.random() * 0.9);
+    ctx.moveTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+    for (let s = 0; s < 4; s++) {
+      a += (Math.random() - 0.5) * 1.4;
+      rr *= 0.72 + Math.random() * 0.5;
+      ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawBeams(dt) {
+  for (let i = beams.length - 1; i >= 0; i--) {
+    const b = beams[i];
+    b.age += dt;
+    if (b.age > b.life) { beams.splice(i, 1); continue; }
+
+    const k = b.age / b.life;
+    const fade = k < 0.12 ? k / 0.12 : Math.pow(1 - (k - 0.12) / 0.88, 1.5);
+    const w = (30 + b.power * 150) * dpr * (0.6 + fade * 0.9);
+
+    if (b.forward) {
+      // Thrust at the camera: the blast expands to swallow the screen.
+      const R = k * Math.hypot(canvas.width, canvas.height) * (0.6 + b.power * 0.8);
+      const g = ctx.createRadialGradient(b.x, b.y, R * 0.25, b.x, b.y, R);
+      g.addColorStop(0,   `rgba(255,255,255,${0.85 * fade})`);
+      g.addColorStop(0.4, `rgba(150,235,255,${0.5 * fade})`);
+      g.addColorStop(1,   'rgba(20,90,220,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(b.x, b.y, R, 0, Math.PI * 2); ctx.fill();
+    } else {
+      // Directional beam: long tapered cone with a white-hot core.
+      const len = Math.hypot(canvas.width, canvas.height) * 1.4;
+      const ex = b.x + b.dx * len, ey = b.y + b.dy * len;
+      const nx = -b.dy, ny = b.dx;
+
+      for (const [mult, alpha, col] of [[3.0, 0.20, '120,210,255'],
+                                        [1.7, 0.42, '170,235,255'],
+                                        [0.75, 0.95, '255,255,255']]) {
+        const ww = w * mult;
+        ctx.fillStyle = `rgba(${col},${alpha * fade})`;
+        ctx.beginPath();
+        ctx.moveTo(b.x + nx * ww * 0.55, b.y + ny * ww * 0.55);
+        ctx.lineTo(ex + nx * ww * 1.9,   ey + ny * ww * 1.9);
+        ctx.lineTo(ex - nx * ww * 1.9,   ey - ny * ww * 1.9);
+        ctx.lineTo(b.x - nx * ww * 0.55, b.y - ny * ww * 0.55);
+        ctx.closePath(); ctx.fill();
+      }
+
+      // muzzle burst at the hands
+      const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, w * 3);
+      g.addColorStop(0, `rgba(255,255,255,${0.9 * fade})`);
+      g.addColorStop(1, 'rgba(40,140,255,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(b.x, b.y, w * 3, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+function drawRings(dt) {
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    r.age += dt;
+    if (r.age > r.life) { rings.splice(i, 1); continue; }
+    const k = r.age / r.life;
+    r.r += (1400 + r.power * 2200) * dpr * dt;
+    ctx.strokeStyle = `rgba(180,240,255,${(1 - k) * 0.7})`;
+    ctx.lineWidth = (14 * (1 - k) + 1) * dpr;
+    ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+function drawParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.age += dt;
+    if (p.age > p.life) { particles.splice(i, 1); continue; }
+    const k = 1 - p.age / p.life;
+
+    if (p.inward) {
+      // spiral inward toward the orb while charging
+      p.radius *= Math.pow(0.02, dt);
+      p.orbit += dt * 3.4;
+      p.x = orbSmooth.x + Math.cos(p.orbit) * p.radius;
+      p.y = orbSmooth.y + Math.sin(p.orbit) * p.radius;
+    } else {
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= Math.pow(0.12, dt); p.vy *= Math.pow(0.12, dt);
+    }
+
+    ctx.fillStyle = `hsla(${p.hue},100%,${65 + k * 30}%,${k})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (0.4 + k), 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawSkeleton() {
+  ctx.lineWidth = 2 * dpr;
+  for (const lm of hands) {
+    ctx.strokeStyle = 'rgba(120,255,200,.75)';
+    for (const [a, b] of BONES) {
+      ctx.beginPath();
+      ctx.moveTo((1 - lm[a].x) * canvas.width, lm[a].y * canvas.height);
+      ctx.lineTo((1 - lm[b].x) * canvas.width, lm[b].y * canvas.height);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    for (const p of lm) {
+      ctx.beginPath();
+      ctx.arc((1 - p.x) * canvas.width, p.y * canvas.height, 3 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawMeter() {
+  const w = canvas.width * 0.24, h = 8 * dpr;
+  const x = (canvas.width - w) / 2, y = canvas.height - 60 * dpr;
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  ctx.fillRect(x, y, w, h);
+  const g = ctx.createLinearGradient(x, 0, x + w, 0);
+  g.addColorStop(0, '#2b8cff'); g.addColorStop(0.6, '#7fdcff'); g.addColorStop(1, '#ffffff');
+  ctx.fillStyle = g;
+  ctx.fillRect(x, y, w * charge, h);
+  if (charge > 0.95) {
+    ctx.fillStyle = `rgba(255,255,255,${0.35 + Math.sin(performance.now() * 0.02) * 0.3})`;
+    ctx.fillRect(x, y, w, h);
+  }
+}
+
+// ---------------------------------------------------------------- loop
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  track(dt);
+  spawnCharge(dt);
+  draw(dt, now);
+
+  statusEl.textContent =
+    state === 'FIRING'   ? 'HAAAAA!' :
+    state === 'CHARGING' ? (charge > 0.95 ? 'MAX CHARGE' : 'KA·ME·HA·ME…') :
+    hands.length >= 2    ? 'bring palms together' :
+    hands.length === 1   ? 'show both hands' : 'no hands detected';
+  statusEl.style.opacity = state === 'IDLE' && !hands.length ? 0.45 : 1;
+}
+
+// ---------------------------------------------------------------- input
+function onKey(e) {
+  const k = e.key.toLowerCase();
+  if (k === 'f') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  } else if (k === 'h') {
+    document.getElementById('hud').classList.toggle('hidden');
+  } else if (k === 'd') {
+    showDebug = !showDebug;
+  } else if (k === 'c') {
+    showCam = !showCam;
+  } else if (k === ' ') {          // manual test fire, no hands needed
+    e.preventDefault();
+    if (!orbSmooth.x) { orbSmooth.x = canvas.width / 2; orbSmooth.y = canvas.height / 2; }
+    charge = 1; fire();
+  }
+}
+
+start();
+</script>
+</body>
+</html>

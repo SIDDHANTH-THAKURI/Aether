@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Projector Show — Morphing Particle Field</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #04060d;
+    overflow: hidden;
+    cursor: none;
+  }
+  canvas { display: block; }
+
+  /* Soft vignette so the projected edges fall off instead of ending hard */
+  #vignette {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center,
+      rgba(0,0,0,0) 45%,
+      rgba(0,0,0,0.35) 78%,
+      rgba(0,0,0,0.75) 100%);
+  }
+
+  #hud {
+    position: fixed;
+    left: 3vh;
+    bottom: 3vh;
+    font: 300 clamp(11px, 1.5vh, 18px)/1.7 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: rgba(255,255,255,0.55);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 1.6s ease;
+  }
+  #hud.hidden { opacity: 0; }
+  #hud b { color: rgba(255,255,255,0.85); font-weight: 500; }
+
+  #title {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    font: 200 clamp(18px, 4vh, 54px)/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: rgba(255,255,255,0.9);
+    letter-spacing: 0.5em;
+    text-transform: uppercase;
+    text-align: center;
+    pointer-events: none;
+    transition: opacity 2.5s ease;
+  }
+  #title.hidden { opacity: 0; }
+
+  #shapename {
+    position: fixed;
+    right: 3vh;
+    bottom: 3vh;
+    font: 300 clamp(11px, 1.5vh, 18px)/1.7 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: rgba(255,255,255,0.4);
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    pointer-events: none;
+    transition: opacity 0.8s ease;
+  }
+
+  #error {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-content: center;
+    text-align: center;
+    font: 300 16px/1.8 system-ui, sans-serif;
+    color: #cfd6e6;
+    padding: 10vh 8vw;
+  }
+</style>
+</head>
+<body>
+
+<div id="vignette"></div>
+<div id="title">Particle Field</div>
+<div id="hud">
+  <b>Space</b> pause &nbsp;·&nbsp; <b>N</b> next form &nbsp;·&nbsp; <b>F</b> fullscreen &nbsp;·&nbsp; <b>H</b> hide text &nbsp;·&nbsp; <b>1-5</b> jump
+</div>
+<div id="shapename"></div>
+<div id="error">
+  Could not start WebGL scene.<br />
+  This page loads three.js from a CDN — check the internet connection, then reload.
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
+
+const COUNT = 160000;          // particles in the morphing field
+const HOLD = 7.0;              // seconds a form is held
+const MORPH = 3.4;             // seconds spent morphing between forms
+
+// ---------------------------------------------------------------- form builders
+// Every builder fills a Float32Array of xyz triples, all roughly inside a
+// radius-40 volume so the camera framing works for each one.
+
+function sphere(n) {
+  const a = new Float32Array(n * 3);
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const y = 1 - (i / (n - 1)) * 2;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const t = golden * i;
+    const shell = 26 + Math.random() * 2.5;
+    a[i * 3]     = Math.cos(t) * r * shell;
+    a[i * 3 + 1] = y * shell;
+    a[i * 3 + 2] = Math.sin(t) * r * shell;
+  }
+  return a;
+}
+
+function torusKnot(n) {
+  const a = new Float32Array(n * 3);
+  const p = 3, q = 5, R = 17, tube = 4.4;
+  for (let i = 0; i < n; i++) {
+    const u = (i / n) * Math.PI * 2 * q;
+    const cu = Math.cos(u), su = Math.sin(u);
+    const quOverP = (q * u) / p;
+    const cs = Math.cos(quOverP);
+    const r = R * (2 + cs) * 0.5;
+    const cx = r * cu;
+    const cy = r * su;
+    const cz = R * Math.sin(quOverP) * 0.5;
+    // scatter around the tube centre so it reads as volume, not a wire
+    const th = Math.random() * Math.PI * 2;
+    const rad = tube * Math.cbrt(Math.random());
+    a[i * 3]     = cx + Math.cos(th) * rad;
+    a[i * 3 + 1] = cy + Math.sin(th) * rad * 0.8;
+    a[i * 3 + 2] = cz + (Math.random() - 0.5) * tube * 1.6;
+  }
+  return a;
+}
+
+function galaxy(n) {
+  const a = new Float32Array(n * 3);
+  const arms = 4;
+  for (let i = 0; i < n; i++) {
+    const t = Math.pow(Math.random(), 0.62);
+    const radius = t * 34;
+    const arm = (i % arms) / arms * Math.PI * 2;
+    const spin = radius * 0.17;
+    const spread = (1 - t) * 2.2 + 1.4;
+    const jx = (Math.random() - 0.5) * spread * 2.4;
+    const jy = (Math.random() - 0.5) * spread * (1.6 - t) * 1.4;
+    const jz = (Math.random() - 0.5) * spread * 2.4;
+    a[i * 3]     = Math.cos(arm + spin) * radius + jx;
+    a[i * 3 + 1] = jy * 1.5;
+    a[i * 3 + 2] = Math.sin(arm + spin) * radius + jz;
+  }
+  return a;
+}
+
+function waveGrid(n) {
+  const a = new Float32Array(n * 3);
+  const side = Math.ceil(Math.sqrt(n));
+  for (let i = 0; i < n; i++) {
+    const gx = (i % side) / side - 0.5;
+    const gz = Math.floor(i / side) / side - 0.5;
+    const x = gx * 74, z = gz * 74;
+    const d = Math.sqrt(x * x + z * z);
+    const y = Math.sin(d * 0.28) * 6.5 * Math.exp(-d * 0.035)
+            + Math.sin(x * 0.13 + z * 0.09) * 2.4;
+    a[i * 3]     = x + (Math.random() - 0.5) * 0.5;
+    a[i * 3 + 1] = y + (Math.random() - 0.5) * 0.5;
+    a[i * 3 + 2] = z + (Math.random() - 0.5) * 0.5;
+  }
+  return a;
+}
+
+function helix(n) {
+  const a = new Float32Array(n * 3);
+  const turns = 5, height = 56, R = 13;
+  for (let i = 0; i < n; i++) {
+    const strand = i % 3;              // 2 backbones + 1 rung population
+    const t = Math.random();
+    const ang = t * Math.PI * 2 * turns;
+    const y = (t - 0.5) * height;
+    if (strand < 2) {
+      const off = strand * Math.PI;
+      const jitter = 1.5;
+      a[i * 3]     = Math.cos(ang + off) * R + (Math.random() - 0.5) * jitter;
+      a[i * 3 + 1] = y + (Math.random() - 0.5) * jitter;
+      a[i * 3 + 2] = Math.sin(ang + off) * R + (Math.random() - 0.5) * jitter;
+    } else {
+      const k = Math.random();         // point along the rung between backbones
+      const x1 = Math.cos(ang) * R, z1 = Math.sin(ang) * R;
+      const x2 = Math.cos(ang + Math.PI) * R, z2 = Math.sin(ang + Math.PI) * R;
+      a[i * 3]     = x1 + (x2 - x1) * k;
+      a[i * 3 + 1] = y;
+      a[i * 3 + 2] = z1 + (z2 - z1) * k;
+    }
+  }
+  return a;
+}
+
+const FORMS = [
+  { name: 'Sphere',      build: sphere,     hue: 0.56 },
+  { name: 'Torus Knot',  build: torusKnot,  hue: 0.83 },
+  { name: 'Galaxy',      build: galaxy,     hue: 0.09 },
+  { name: 'Wave Field',  build: waveGrid,   hue: 0.44 },
+  { name: 'Helix',       build: helix,      hue: 0.70 },
+];
+
+// ---------------------------------------------------------------- scene
+let renderer, scene, camera, composer, bloom, fxaa, points, stars, material;
+let clock, shapes, current = 0, next = 1, morphStart = -HOLD, paused = false;
+let elapsed = 0;
+
+function init() {
+  renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setClearColor(0x04060d, 1);
+  document.body.appendChild(renderer.domElement);
+
+  scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x04060d, 0.0075);
+
+  camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 800);
+  camera.position.set(0, 14, 78);
+
+  shapes = FORMS.map(f => f.build(COUNT));
+
+  // Two position attributes: the field morphs from A to B, then A is refilled.
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(shapes[0].slice(), 3));
+  geo.setAttribute('aPosA', new THREE.BufferAttribute(shapes[0].slice(), 3));
+  geo.setAttribute('aPosB', new THREE.BufferAttribute(shapes[1].slice(), 3));
+
+  const seeds = new Float32Array(COUNT);
+  for (let i = 0; i < COUNT; i++) seeds[i] = Math.random();
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1));
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 90);
+
+  material = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime:     { value: 0 },
+      uProgress: { value: 0 },
+      uSize:     { value: 44.0 * Math.min(devicePixelRatio, 2) },
+      uHueA:     { value: FORMS[0].hue },
+      uHueB:     { value: FORMS[1].hue },
+      uDrift:    { value: 1.0 },
+    },
+    vertexShader: VERT,
+    fragmentShader: FRAG,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+
+  points = new THREE.Points(geo, material);
+  scene.add(points);
+  scene.add(makeStars());
+
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+
+  bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.85, 0.6, 0.18);
+  composer.addPass(bloom);
+
+  fxaa = new ShaderPass(FXAAShader);
+  composer.addPass(fxaa);
+  sizeFXAA();
+
+  clock = new THREE.Clock();
+  addEventListener('resize', onResize);
+  addEventListener('keydown', onKey);
+
+  setTimeout(() => document.getElementById('title').classList.add('hidden'), 4200);
+  setTimeout(() => document.getElementById('hud').classList.add('hidden'), 9000);
+  showName(FORMS[0].name);
+}
+
+function makeStars() {
+  const n = 6000;
+  const pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const r = 210 + Math.random() * 190;
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(2 * Math.random() - 1);
+    pos[i * 3]     = r * Math.sin(ph) * Math.cos(th);
+    pos[i * 3 + 1] = r * Math.cos(ph);
+    pos[i * 3 + 2] = r * Math.sin(ph) * Math.sin(th);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  stars = new THREE.Points(g, new THREE.PointsMaterial({
+    color: 0x9fb6ff, size: 1.1, sizeAttenuation: true,
+    transparent: true, opacity: 0.5, depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  }));
+  return stars;
+}
+
+// ---------------------------------------------------------------- shaders
+const NOISE = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+             i.z + vec4(0.0, i1.z, i2.z, 1.0))
+           + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+           + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}`;
+
+const VERT = `
+attribute vec3 aPosA;
+attribute vec3 aPosB;
+attribute float aSeed;
+
+uniform float uTime;
+uniform float uProgress;
+uniform float uSize;
+uniform float uHueA;
+uniform float uHueB;
+uniform float uDrift;
+
+varying vec3 vColor;
+varying float vAlpha;
+
+${NOISE}
+
+vec3 hsl2rgb(vec3 c){
+  vec3 rgb = clamp(abs(mod(c.x*6.0 + vec3(0.0,4.0,2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+  return c.z + c.y * (rgb - 0.5) * (1.0 - abs(2.0*c.z - 1.0));
+}
+
+void main() {
+  // Per-particle stagger so the morph sweeps across the field instead of
+  // every point snapping at the same instant.
+  float stagger = aSeed * 0.45;
+  float t = clamp((uProgress - stagger) / (1.0 - 0.45), 0.0, 1.0);
+  t = t * t * (3.0 - 2.0 * t);                 // smoothstep ease
+
+  vec3 pos = mix(aPosA, aPosB, t);
+
+  // Particles bow outward mid-morph, so the transition blooms rather than
+  // sliding along straight lines.
+  float burst = sin(t * 3.14159265) * (6.0 + aSeed * 10.0);
+  pos += normalize(pos + vec3(0.001)) * burst;
+
+  // Slow organic drift, always on
+  float ns = uTime * 0.13 + aSeed * 6.28;
+  vec3 drift = vec3(
+    snoise(pos * 0.021 + vec3(ns, 0.0, 0.0)),
+    snoise(pos * 0.021 + vec3(0.0, ns, 40.0)),
+    snoise(pos * 0.021 + vec3(80.0, 0.0, ns))
+  );
+  pos += drift * 3.6 * uDrift;
+
+  vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+  gl_Position = projectionMatrix * mv;
+
+  float dist = -mv.z;
+  gl_PointSize = uSize * (1.0 / max(dist, 1.0)) * (0.55 + aSeed * 0.9);
+
+  // Hue drifts with the form, with a per-particle spread and a slow global cycle
+  float hue = mix(uHueA, uHueB, t) + aSeed * 0.13 + length(pos) * 0.0022
+            + sin(uTime * 0.05) * 0.04;
+  float light = 0.52 + aSeed * 0.24 + sin(t * 3.14159265) * 0.14;
+  vColor = hsl2rgb(vec3(fract(hue), 0.82, light));
+
+  vAlpha = smoothstep(320.0, 40.0, dist) * (0.35 + aSeed * 0.55);
+}`;
+
+const FRAG = `
+precision highp float;
+varying vec3 vColor;
+varying float vAlpha;
+
+void main() {
+  vec2 d = gl_PointCoord - 0.5;
+  float r = dot(d, d) * 4.0;
+  if (r > 1.0) discard;
+  float glow = pow(1.0 - r, 2.4);          // soft round falloff
+  gl_FragColor = vec4(vColor * glow, glow * vAlpha);
+}`;
+
+// ---------------------------------------------------------------- morph driver
+function advance() {
+  current = next;
+  next = (next + 1) % FORMS.length;
+
+  const geo = points.geometry;
+  geo.attributes.aPosA.array.set(shapes[current]);
+  geo.attributes.aPosB.array.set(shapes[next]);
+  geo.attributes.aPosA.needsUpdate = true;
+  geo.attributes.aPosB.needsUpdate = true;
+
+  material.uniforms.uHueA.value = FORMS[current].hue;
+  material.uniforms.uHueB.value = FORMS[next].hue;
+  material.uniforms.uProgress.value = 0;
+
+  morphStart = elapsed + HOLD;
+  showName(FORMS[current].name);
+}
+
+function jumpTo(i) {
+  next = i;
+  advance();
+  next = (i + 1) % FORMS.length;
+  material.uniforms.uHueB.value = FORMS[next].hue;
+  points.geometry.attributes.aPosB.array.set(shapes[next]);
+  points.geometry.attributes.aPosB.needsUpdate = true;
+}
+
+let nameTimer;
+function showName(text) {
+  const el = document.getElementById('shapename');
+  el.textContent = text;
+  el.style.opacity = '1';
+  clearTimeout(nameTimer);
+  nameTimer = setTimeout(() => { el.style.opacity = '0'; }, 3500);
+}
+
+// ---------------------------------------------------------------- loop
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  if (!paused) elapsed += dt;
+
+  material.uniforms.uTime.value = elapsed;
+
+  const since = elapsed - morphStart;
+  if (since >= 0) {
+    const p = since / MORPH;
+    if (p >= 1) {
+      material.uniforms.uProgress.value = 1;
+      advance();
+    } else {
+      material.uniforms.uProgress.value = p;
+    }
+  }
+
+  // Camera: slow orbit with an easing bob, framed on the origin
+  const a = elapsed * 0.055;
+  const radius = 76 + Math.sin(elapsed * 0.09) * 16;
+  camera.position.set(
+    Math.cos(a) * radius,
+    16 + Math.sin(elapsed * 0.13) * 16,
+    Math.sin(a) * radius
+  );
+  camera.lookAt(0, 0, 0);
+
+  points.rotation.y = elapsed * 0.035;
+  stars.rotation.y = -elapsed * 0.008;
+
+  composer.render();
+}
+
+// ---------------------------------------------------------------- input
+function onKey(e) {
+  const k = e.key.toLowerCase();
+  if (k === ' ') { paused = !paused; e.preventDefault(); }
+  else if (k === 'n') { material.uniforms.uProgress.value = 1; advance(); }
+  else if (k === 'f') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen();
+  }
+  else if (k === 'h') {
+    document.getElementById('hud').classList.toggle('hidden');
+    document.getElementById('title').classList.add('hidden');
+  }
+  else if (k >= '1' && k <= String(FORMS.length)) jumpTo(parseInt(k, 10) - 1);
+}
+
+function sizeFXAA() {
+  const px = renderer.getPixelRatio();
+  fxaa.material.uniforms.resolution.value.set(1 / (innerWidth * px), 1 / (innerHeight * px));
+}
+
+function onResize() {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  bloom.setSize(innerWidth, innerHeight);
+  sizeFXAA();
+}
+
+try {
+  init();
+  animate();
+} catch (e) {
+  console.error(e);
+  document.getElementById('error').style.display = 'grid';
+}
+</script>
+</body>
+</html>

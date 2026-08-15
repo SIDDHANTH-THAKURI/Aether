@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Projects — Aether</title>
+<meta name="description" content="Gesture-driven, camera-tracked visual experiments. Pick one and open it fullscreen." />
+<meta name="theme-color" content="#05060a" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><radialGradient id='g'><stop offset='0' stop-color='%23fff'/><stop offset='.45' stop-color='%23ffc46b'/><stop offset='1' stop-color='%23ff5230'/></radialGradient></defs><circle cx='16' cy='16' r='10' fill='url(%23g)'/></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<canvas id="bg" aria-hidden="true"></canvas>
+<canvas id="trail" aria-hidden="true"></canvas>
+<div class="grain" aria-hidden="true"></div>
+
+<nav class="nav" id="nav">
+  <div class="nav-in shell">
+    <a class="mark" href="index.html"><i></i> Aether</a>
+    <div class="nav-links">
+      <a href="index.html#how" class="hide-sm">How it works</a>
+      <a class="btn btn-ghost btn-sm" href="index.html">
+        <svg width="15" height="9" viewBox="0 0 18 10" fill="none" aria-hidden="true">
+          <path d="M18 5H2M6 1 2 5l4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Home
+      </a>
+    </div>
+  </div>
+</nav>
+
+<div class="content">
+  <main class="shell" style="padding-bottom:2rem">
+
+    <header class="gal-head">
+      <div class="eyebrow rise"><span style="animation-delay:.05s">The collection</span></div>
+      <h1 class="rise"><span style="animation-delay:.12s">Projects</span></h1>
+      <p class="lead rise"><span style="animation-delay:.24s">
+        Everything here runs in the browser — no install, no download. The hand-tracked
+        pieces ask for camera access when they open, and the video never leaves your
+        machine. Best result: fullscreen, dark room, projector.
+      </span></p>
+    </header>
+
+    <nav class="filters" id="filters" aria-label="Filter projects by tag"></nav>
+
+    <section class="grid" id="grid"></section>
+    <p class="empty" id="empty" hidden>Nothing matches that filter.</p>
+
+    <div class="closer reveal" style="margin-top:clamp(4rem,10vh,7rem)">
+      <div class="eyebrow" style="justify-content:center">More coming</div>
+      <h2>New experiments land <b>as they're built.</b></h2>
+      <p class="lead" style="max-width:46ch">
+        Each one is a single self-contained page. Adding another is one entry in
+        <code style="font-family:var(--mono);color:var(--ember-hi)">projects.js</code>.
+      </p>
+      <a class="btn btn-primary" href="phoenix.html">
+        Start with Phoenix
+        <svg width="18" height="10" viewBox="0 0 18 10" fill="none" aria-hidden="true">
+          <path d="M0 5h16M12 1l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </a>
+    </div>
+
+    <footer class="foot">
+      <div>Aether · Gesture-driven visual experiments</div>
+      <div>Video never leaves your machine</div>
+      <div><a href="index.html">Home</a></div>
+    </footer>
+
+  </main>
+</div>
+
+<script type="module">
+import { projects } from './projects.js';
+import { cardHTML, mountReveal, mountNav, mountPageFade, mountBackground, mountTrail }
+  from './site.js';
+
+const grid = document.getElementById('grid');
+const filters = document.getElementById('filters');
+const empty = document.getElementById('empty');
+let active = 'All';
+
+function render() {
+  const list = projects.filter(p => active === 'All' || p.tags.includes(active));
+  grid.innerHTML = list.map(cardHTML).join('');
+  empty.hidden = list.length > 0;
+  // Cards are rebuilt on every filter change, so re-arm their reveal.
+  requestAnimationFrame(() => {
+    grid.querySelectorAll('.reveal').forEach(el => el.classList.add('in'));
+  });
+}
+
+['All', ...new Set(projects.flatMap(p => p.tags))].forEach(t => {
+  const b = document.createElement('button');
+  b.className = 'chip';
+  b.type = 'button';
+  b.textContent = t;
+  b.setAttribute('aria-pressed', String(t === active));
+  b.addEventListener('click', () => {
+    active = t;
+    [...filters.children].forEach(c =>
+      c.setAttribute('aria-pressed', String(c.textContent === active)));
+    render();
+  });
+  filters.appendChild(b);
+});
+
+render();
+mountReveal();
+mountNav();
+mountPageFade();
+mountBackground();
+mountTrail();
+</script>
+</body>
+</html>

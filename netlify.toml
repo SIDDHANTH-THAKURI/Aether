@@ -1,0 +1,10 @@
+# Static site — nothing to build, serve the folder as-is.
+[build]
+  publish = "."
+  command = ""
+
+# The hand-tracked pages need the camera on the same origin.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Permissions-Policy = "camera=(self)"

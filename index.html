@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aether — your hands are the controller</title>
+<meta name="description" content="Gesture-driven, camera-tracked visual effects that run in the browser. Snap, cup and throw fire with your hands. Built for projectors." />
+<meta name="theme-color" content="#05060a" />
+<meta property="og:title" content="Aether — your hands are the controller" />
+<meta property="og:description" content="Camera-tracked WebGL effects you drive with your hands. No install, no controller." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><radialGradient id='g'><stop offset='0' stop-color='%23fff'/><stop offset='.45' stop-color='%23ffc46b'/><stop offset='1' stop-color='%23ff5230'/></radialGradient></defs><circle cx='16' cy='16' r='10' fill='url(%23g)'/></svg>" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<canvas id="bg" aria-hidden="true"></canvas>
+<canvas id="trail" aria-hidden="true"></canvas>
+<div class="grain" aria-hidden="true"></div>
+
+<nav class="nav" id="nav">
+  <div class="nav-in shell">
+    <a class="mark" href="#top"><i></i> Aether</a>
+    <div class="nav-links">
+      <a href="#work" class="hide-sm">Projects</a>
+      <a href="#how" class="hide-sm">How it works</a>
+      <a class="btn btn-ghost btn-sm" href="projects.html">
+        Enter
+        <svg width="15" height="9" viewBox="0 0 18 10" fill="none" aria-hidden="true">
+          <path d="M0 5h16M12 1l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </a>
+    </div>
+  </div>
+</nav>
+
+<div class="content" id="top">
+
+  <!-- ------------------------------------------------------- hero -->
+  <header class="hero shell">
+    <div class="eyebrow rise"><span style="animation-delay:.05s">Real-time · In-browser · No install</span></div>
+
+    <h1 class="rise">
+      <span style="animation-delay:.12s">Your hands</span>
+      <span style="animation-delay:.22s">are the</span>
+      <em style="animation-delay:.32s">controller.</em>
+    </h1>
+
+    <p class="lead rise"><span style="animation-delay:.44s">
+      A camera watches your hands and the effect answers instantly — snap to strike a
+      spark, cup your palm to hold it, flick to throw. Nothing worn, nothing held,
+      nothing uploaded. Point it at a wall and play.
+    </span></p>
+
+    <div class="hero-cta rise"><span style="animation-delay:.56s">
+      <a class="btn btn-primary" href="projects.html">
+        Enter the collection
+        <svg width="18" height="10" viewBox="0 0 18 10" fill="none" aria-hidden="true">
+          <path d="M0 5h16M12 1l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </a>
+      <a class="btn btn-ghost" href="phoenix.html">Try Phoenix now</a>
+    </span></div>
+
+    <div class="stats rise"><span style="animation-delay:.66s">
+      <span class="stat"><b id="stat-count">3</b><span>Live experiments</span></span>
+      <span class="stat"><b>21</b><span>Tracked points per hand</span></span>
+      <span class="stat"><b>60</b><span>Frames per second</span></span>
+      <span class="stat"><b>0</b><span>Installs required</span></span>
+    </span></div>
+
+    <div class="scroll-cue" aria-hidden="true"><i></i>Scroll</div>
+  </header>
+
+  <!-- ------------------------------------------------------- marquee -->
+  <div class="marquee" aria-hidden="true">
+    <div class="marquee-track" id="marquee"></div>
+  </div>
+
+  <!-- ------------------------------------------------------- how -->
+  <section class="section shell" id="how">
+    <div class="section-head reveal">
+      <div class="eyebrow">The gesture chain</div>
+      <h2 class="section-title">Three moves, <b>one flow.</b></h2>
+      <p class="lead">
+        Each move is read from the geometry of your hand, frame by frame — the gap
+        between your thumb and middle finger, how far your fingertips sit from your
+        palm, how fast that palm is travelling. No training, no recording, no lag.
+      </p>
+    </div>
+
+    <div class="steps">
+      <article class="step reveal">
+        <div class="num">01 / Ignite</div>
+        <div class="demo"><span class="dot"></span></div>
+        <h3>Snap</h3>
+        <p>Pinch thumb to middle finger and flick them apart. The sudden gap opening is
+           the trigger — a spark cracks to life on your fingertips.</p>
+      </article>
+
+      <article class="step reveal" style="transition-delay:.09s">
+        <div class="num">02 / Hold</div>
+        <div class="demo"><span class="ring"></span><span class="ring d2"></span></div>
+        <h3>Cup</h3>
+        <p>Open your palm and the spark drops into it, growing into a fireball that
+           charges the longer you hold. Close your hand and it snuffs out.</p>
+      </article>
+
+      <article class="step reveal" style="transition-delay:.18s">
+        <div class="num">03 / Release</div>
+        <div class="demo"><span class="comet"></span></div>
+        <h3>Throw</h3>
+        <p>Flick your hand and it launches along the exact path you threw it, arcing
+           down before it detonates. Charge decides the size of the blast.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- work -->
+  <section class="section shell" id="work">
+    <div class="section-head reveal">
+      <div class="head-row">
+        <div style="display:grid;gap:1.2rem">
+          <div class="eyebrow">The collection</div>
+          <h2 class="section-title">Pick something <b>and move.</b></h2>
+        </div>
+        <a class="btn btn-ghost btn-sm" href="projects.html">
+          View all
+          <svg width="15" height="9" viewBox="0 0 18 10" fill="none" aria-hidden="true">
+            <path d="M0 5h16M12 1l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </a>
+      </div>
+    </div>
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <!-- ------------------------------------------------------- closer -->
+  <section class="shell" style="padding-bottom:2rem">
+    <div class="closer reveal">
+      <div class="eyebrow" style="justify-content:center">Best served big</div>
+      <h2>Point a projector at a wall. <b>Turn the lights off.</b></h2>
+      <p class="lead" style="max-width:48ch">
+        Everything renders at full screen resolution with bloom, heat haze and
+        shockwave lensing. It was built for a dark room and a big surface.
+      </p>
+      <a class="btn btn-primary" href="projects.html">
+        Enter the collection
+        <svg width="18" height="10" viewBox="0 0 18 10" fill="none" aria-hidden="true">
+          <path d="M0 5h16M12 1l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </a>
+    </div>
+
+    <footer class="foot">
+      <div>Aether · Gesture-driven visual experiments</div>
+      <div>Video never leaves your machine</div>
+      <div><a href="projects.html">Projects</a> · <a href="#top">Back to top</a></div>
+    </footer>
+  </section>
+
+</div>
+
+<script type="module">
+import { projects } from './projects.js';
+import { cardHTML, mountReveal, mountNav, mountPageFade, mountBackground, mountTrail }
+  from './site.js';
+
+const live = projects.filter(p => p.status === 'live');
+document.getElementById('stat-count').textContent = live.length;
+document.getElementById('grid').innerHTML = live.map(cardHTML).join('');
+
+const words = ['MediaPipe hand tracking', 'WebGL2', 'Instanced particles', 'Bloom',
+  'Heat haze', 'Shockwave lensing', 'Blackbody colour ramp', 'WebAudio synthesis',
+  'ACES tonemapping', 'Zero installs'];
+document.getElementById('marquee').innerHTML =
+  [...words, ...words].map(w => `<span>${w}</span>`).join('');
+
+mountReveal();
+mountNav();
+mountPageFade();
+mountBackground();
+mountTrail();
+</script>
+</body>
+</html>
