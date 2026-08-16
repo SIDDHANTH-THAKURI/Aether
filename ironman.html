@@ -1,0 +1,1052 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mark VII — suit up</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#02050a; overflow:hidden; }
+  canvas { display:block; }
+  #three { position:fixed; inset:0; width:100%; height:100%; }
+  #ui { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; z-index:5; }
+
+  #hud {
+    position:fixed; left:2.6vh; bottom:2.6vh; z-index:30;
+    font:300 clamp(11px,1.5vh,16px)/1.9 system-ui,-apple-system,"Segoe UI",sans-serif;
+    color:rgba(190,232,255,.6); letter-spacing:.1em; text-transform:uppercase;
+    pointer-events:none; transition:opacity .8s ease; text-shadow:0 0 14px rgba(0,0,0,.95);
+  }
+  #hud.hidden { opacity:0; }
+  #hud b { color:#5fd0ff; font-weight:500; }
+
+  #status {
+    position:fixed; left:50%; top:3.4vh; transform:translateX(-50%); z-index:30;
+    font:300 clamp(12px,1.9vh,21px)/1.4 system-ui,sans-serif;
+    color:rgba(214,242,255,.88); letter-spacing:.44em; text-transform:uppercase;
+    pointer-events:none; text-shadow:0 0 24px rgba(60,180,255,.95); white-space:nowrap;
+  }
+  #sound {
+    position:fixed; left:50%; bottom:2.6vh; transform:translateX(-50%); z-index:30;
+    font:400 clamp(10px,1.3vh,14px)/1.6 system-ui,sans-serif; color:#8fdcff;
+    letter-spacing:.2em; text-transform:uppercase; cursor:pointer;
+    background:rgba(0,26,44,.55); border:1px solid rgba(90,200,255,.4);
+    padding:.65em 1.15em; border-radius:2em; backdrop-filter:blur(6px);
+    transition:opacity .5s ease;
+  }
+  #sound.gone { opacity:0; pointer-events:none; }
+</style>
+</head>
+<body>
+
+<canvas id="three"></canvas>
+<canvas id="ui"></canvas>
+<div id="status"></div>
+<div id="sound">click for sound</div>
+<div id="hud">
+  <b>Stand back, arms out wide</b> to suit up &nbsp;·&nbsp;
+  <b>Raise a palm</b> to charge &nbsp;·&nbsp; <b>push it forward</b> to fire<br>
+  <b>F</b> fullscreen &nbsp;·&nbsp; <b>H</b> hide &nbsp;·&nbsp; <b>C</b> camera &nbsp;·&nbsp;
+  <b>D</b> debug &nbsp;·&nbsp; <b>M</b> mute &nbsp;·&nbsp; <b>R</b> reset &nbsp;·&nbsp;
+  <b>Space</b> force suit-up
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+import { createTracker, palmCenter, handScale, spread, isFist, isOpenPalm,
+         Gate, conf, drawHandDebug, POSE } from './handtrack.js';
+import { buildSuit } from './ironman/armor.js';
+
+// ================================================================
+// TUNING
+// ================================================================
+const PIECE_STAGGER = 0.26;   // seconds between pieces launching
+const PIECE_FLIGHT  = 0.78;   // seconds each piece spends in the air
+const CHARGE_TIME   = 1.15;   // seconds from raised palm to full charge
+const MIN_FIRE      = 0.25;   // charge needed before a push will fire
+const PUSH_FIRE     = 1.25;   // hand-growth rate that counts as a thrust
+const COOLDOWN      = 0.5;
+
+const clamp = THREE.MathUtils.clamp;
+const lerp = THREE.MathUtils.lerp;
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+const statusEl = document.getElementById('status');
+const soundBtn = document.getElementById('sound');
+const uiCanvas = document.getElementById('ui');
+const uictx = uiCanvas.getContext('2d');
+
+let tracker = null, W = 1, H = 1, dpr = 1;
+let showDebug = false, showCam = true;
+let flash = 0, ca = 0, shake = 0, shakeT = 0;
+
+// suit state
+let phase = 'idle';        // idle | assembling | booting | online
+let seqTime = 0, bootTime = 0;
+const seatedAt = new Map();
+
+// ================================================================
+// RENDERER
+// ================================================================
+const renderer = new THREE.WebGLRenderer({
+  canvas: document.getElementById('three'),
+  antialias: true, alpha: false, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+camera.position.set(0, 0, 6);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envMap = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environment = envMap;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+const key = new THREE.DirectionalLight(0xffffff, 1.35);
+key.position.set(2, 3, 5);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x5fb4ff, 0.8);
+rim.position.set(-3, 1, -2);
+scene.add(rim);
+
+// --- camera feed with light spill from the reactor and repulsors
+const bgMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTex: { value: null }, uHas: { value: 0 }, uMirror: { value: 1 },
+    uVideoAspect: { value: 16 / 9 }, uAspect: { value: 16 / 9 },
+    uL1: { value: new THREE.Vector3(0.5, 0.5, 0) },   // xy pos, z strength
+    uL2: { value: new THREE.Vector3(0.5, 0.5, 0) },
+    uL3: { value: new THREE.Vector3(0.5, 0.5, 0) },
+  },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.999, 1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform float uHas, uMirror, uVideoAspect, uAspect;
+    uniform vec3 uL1, uL2, uL3;
+    vec3 spill(vec2 uv, vec3 L, float l){
+      vec2 d = (uv - L.xy) * vec2(uAspect, 1.0);
+      return vec3(0.30,0.62,1.0) * exp(-dot(d,d)*4.5) * L.z * (0.3 + l*2.1);
+    }
+    void main(){
+      vec2 uv = vUv;
+      float s = uVideoAspect / uAspect;
+      if(s > 1.0) uv.x = (uv.x - 0.5) / s + 0.5;
+      else        uv.y = (uv.y - 0.5) * s + 0.5;
+      if(uMirror > 0.5) uv.x = 1.0 - uv.x;
+
+      vec3 c = texture2D(uTex, uv).rgb * uHas;
+      float l = dot(c, vec3(0.299,0.587,0.114));
+      c = mix(vec3(l), c, 0.5);
+      c *= vec3(0.22, 0.24, 0.31);
+      c += vec3(0.010, 0.012, 0.021);
+
+      c += spill(vUv, uL1, l);
+      c += spill(vUv, uL2, l);
+      c += spill(vUv, uL3, l);
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+  depthWrite: false, depthTest: false,
+});
+const bgScene = new THREE.Scene();
+const bgCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+bgScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bgMat));
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(bgScene, bgCam));
+const mainPass = new RenderPass(scene, camera);
+mainPass.clear = false;
+composer.addPass(mainPass);
+
+// Motion blur, dialled up only while things are actually flying or firing.
+const afterimage = new AfterimagePass(0.0);
+composer.addPass(afterimage);
+
+// threshold near 1 so only the reactor, eyes and repulsors bloom — a low
+// threshold here was blowing out the armour and the whole camera feed
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.5, 0.45, 0.9);
+composer.addPass(bloom);
+
+const finalPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null }, uTime: { value: 0 }, uCA: { value: 0 },
+    uFlash: { value: 0 }, uAspect: { value: 1 }, uShake: { value: new THREE.Vector2() },
+    uScan: { value: 0 },
+  },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse;
+    uniform float uTime, uCA, uFlash, uAspect, uScan;
+    uniform vec2 uShake;
+    void main(){
+      vec2 uv = vUv + uShake;
+      vec2 dc = uv - 0.5;
+      float ca = (0.0008 + uCA*0.026) * pow(length(dc)*2.0, 1.6);
+      vec3 col;
+      col.r = texture2D(tDiffuse, uv + dc*ca).r;
+      col.g = texture2D(tDiffuse, uv).g;
+      col.b = texture2D(tDiffuse, uv - dc*ca).b;
+
+      col += vec3(0.72,0.90,1.0) * uFlash;
+
+      // faint interlace, like looking through a visor
+      col *= 1.0 - uScan * 0.06 * step(0.5, fract(vUv.y * 420.0));
+
+      float vig = smoothstep(1.30, 0.30, length((vUv-0.5)*vec2(uAspect,1.0))*1.6);
+      col *= mix(0.42, 1.0, vig);
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+composer.addPass(finalPass);
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H);
+  composer.setSize(W, H);
+  bloom.setSize(W, H);
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  bgMat.uniforms.uAspect.value = W / H;
+  finalPass.uniforms.uAspect.value = W / H;
+  uiCanvas.width = Math.floor(W * dpr);
+  uiCanvas.height = Math.floor(H * dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+function worldAt(nx, ny, z = 0) {
+  const dist = camera.position.z - z;
+  const h = 2 * Math.tan((camera.fov * Math.PI / 180) / 2) * dist;
+  return new THREE.Vector3(nx * h * camera.aspect / 2, ny * h / 2, z);
+}
+const worldHeight = (z = 0) =>
+  2 * Math.tan((camera.fov * Math.PI / 180) / 2) * (camera.position.z - z);
+
+// ================================================================
+// SUIT
+// ================================================================
+const suit = buildSuit(envMap);
+const suitGroup = new THREE.Group();
+scene.add(suitGroup);
+for (const p of suit.pieces) suitGroup.add(p.holder);
+
+const chestPiece = suit.pieces.find(p => p.id === 'chest');
+const helmetPiece = suit.pieces.find(p => p.id === 'helmet');
+const gauntlets = {
+  Left: suit.pieces.find(p => p.id === 'gauntletL'),
+  Right: suit.pieces.find(p => p.id === 'gauntletR'),
+};
+
+const reactorLight = new THREE.PointLight(0x7fd8ff, 0, 9, 2);
+scene.add(reactorLight);
+
+// ---- particles (flight trails, charge motes, sparks)
+const PMAX = 3000;
+const pPos = new Float32Array(PMAX * 3);
+const pSize = new Float32Array(PMAX);
+const pSeed = new Float32Array(PMAX);
+const pData = [];
+const pGeo = new THREE.BufferGeometry();
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+pGeo.setAttribute('aSize', new THREE.BufferAttribute(pSize, 1));
+pGeo.setAttribute('aSeed', new THREE.BufferAttribute(pSeed, 1));
+pGeo.setDrawRange(0, 0);
+const pMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: `
+    attribute float aSize; attribute float aSeed;
+    varying float vSeed;
+    void main(){
+      vSeed = aSeed;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      gl_PointSize = aSize * (320.0 / max(-mv.z, 0.001));
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: `
+    precision highp float;
+    uniform float uTime; varying float vSeed;
+    void main(){
+      vec2 d = gl_PointCoord - 0.5;
+      float r = dot(d,d)*4.0;
+      if(r > 1.0) discard;
+      float g = pow(1.0-r, 2.6);
+      float tw = 0.6 + 0.4*sin(uTime*24.0 + vSeed*40.0);
+      vec3 col = mix(vec3(0.35,0.75,1.0), vec3(1.0), g*tw);
+      gl_FragColor = vec4(col * g * tw, g * tw);
+    }`,
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+});
+scene.add(new THREE.Points(pGeo, pMat));
+
+function particle(p, v, opts = {}) {
+  if (pData.length >= PMAX) pData.shift();
+  pData.push({
+    p: p.clone(), v: v.clone(),
+    life: opts.life ?? rnd(0.3, 0.8), age: 0,
+    size: opts.size ?? rnd(2, 6), drag: opts.drag ?? 0.25, grav: opts.grav ?? 0,
+    seed: Math.random(),
+  });
+}
+
+function updateParticles(dt) {
+  for (let i = pData.length - 1; i >= 0; i--) {
+    const s = pData[i];
+    s.age += dt;
+    if (s.age > s.life) { pData.splice(i, 1); continue; }
+    s.v.y += s.grav * dt;
+    s.v.multiplyScalar(Math.pow(s.drag, dt));
+    s.p.addScaledVector(s.v, dt);
+  }
+  pData.forEach((s, i) => {
+    const k = 1 - s.age / s.life;
+    pPos[i * 3] = s.p.x; pPos[i * 3 + 1] = s.p.y; pPos[i * 3 + 2] = s.p.z;
+    pSize[i] = s.size * (0.3 + k);
+    pSeed[i] = s.seed;
+  });
+  pGeo.setDrawRange(0, pData.length);
+  pGeo.attributes.position.needsUpdate = true;
+  pGeo.attributes.aSize.needsUpdate = true;
+  pGeo.attributes.aSeed.needsUpdate = true;
+}
+
+// ---- shockwave rings
+const rings = [];
+const ringGeo = new THREE.RingGeometry(0.9, 1.0, 64);
+const ringMat = new THREE.MeshBasicMaterial({
+  color: 0x9fe0ff, transparent: true, opacity: 0.8,
+  blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+});
+function ring(pos, power = 1) {
+  const m = new THREE.Mesh(ringGeo, ringMat.clone());
+  m.position.copy(pos);
+  scene.add(m);
+  rings.push({ m, age: 0, life: 0.5, power });
+}
+function updateRings(dt) {
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i];
+    r.age += dt;
+    const k = r.age / r.life;
+    if (k >= 1) { scene.remove(r.m); r.m.material.dispose(); rings.splice(i, 1); continue; }
+    r.m.scale.setScalar(0.1 + k * 3.2 * r.power);
+    r.m.material.opacity = (1 - k) * 0.8;
+  }
+}
+
+// ================================================================
+// BODY ATTACHMENT
+// ================================================================
+/** Where a piece belongs right now, from the live pose. */
+function targetFor(def, pose) {
+  const a = pose[def.from], b = pose[def.to];
+  if (!a || !b) return null;
+  if ((a.visibility ?? 1) < 0.35 || (b.visibility ?? 1) < 0.35) return null;
+
+  const na = tracker.toNDC(a), nb = tracker.toNDC(b);
+  const z = def.head ? 0.55 : def.torso ? 0.15 : 0.35;
+  const wa = worldAt(na.x, na.y, z), wb = worldAt(nb.x, nb.y, z);
+
+  const pos = wa.clone().lerp(wb, def.at);
+  const axis = wb.clone().sub(wa);
+  const len = axis.length();
+  const angle = Math.atan2(axis.y, axis.x);
+
+  if (def.drop) pos.y -= len * def.drop;
+
+  // limb pieces run along their own +Y, so align that axis with the bone
+  const rot = def.align ? angle - Math.PI / 2 : 0;
+  const scale = def.align
+    ? (len / (def.nominal || 1)) * (def.scale || 1)
+    : len * (def.scale || 1);
+
+  return { pos, rot, scale: Math.max(scale, 1e-3), len };
+}
+
+function startSuitUp() {
+  if (phase !== 'idle') return;
+  phase = 'assembling';
+  seqTime = 0;
+  seatedAt.clear();
+  // origins are recomputed against wherever the body is standing now
+  for (const p of suit.pieces) {
+    p.seated = false; p.t = 0; p.holder.visible = false; p.origin = null;
+  }
+  sfx.launch();
+}
+
+function resetSuit() {
+  phase = 'idle';
+  seqTime = 0;
+  for (const p of suit.pieces) {
+    p.seated = false; p.t = 0; p.holder.visible = false; p.origin = null;
+  }
+  seatedAt.clear();
+  reactorLight.intensity = 0;
+}
+
+function updateSuit(pose, dt, time) {
+  if (phase === 'idle') return;
+  seqTime += dt;
+
+  let allSeated = true;
+
+  suit.pieces.forEach((p, i) => {
+    const target = pose ? targetFor(p, pose) : null;
+    const launchAt = i * PIECE_STAGGER;
+
+    if (!target) {
+      // the body part is out of frame — hide rather than guess
+      if (!p.seated) allSeated = false;
+      p.holder.visible = false;
+      return;
+    }
+
+    if (phase === 'assembling' && seqTime < launchAt) {
+      p.holder.visible = false;
+      allSeated = false;
+      return;
+    }
+
+    p.holder.visible = true;
+
+    if (!p.seated) {
+      allSeated = false;
+      p.t = clamp((seqTime - launchAt) / PIECE_FLIGHT, 0, 1);
+
+      // fly in from off screen, on a curved approach
+      if (!p.origin) {
+        const side = (i % 2 ? 1 : -1) * rnd(1.6, 2.6);
+        p.origin = new THREE.Vector3(
+          target.pos.x + side * 3.5, target.pos.y + rnd(-1.5, 2.5), rnd(-3, 4));
+      }
+      const e = p.t * p.t * (3 - 2 * p.t);
+      const overshoot = Math.sin(p.t * Math.PI) * 0.35;
+      p.holder.position.lerpVectors(p.origin, target.pos, e);
+      p.holder.position.z += overshoot;
+      p.holder.rotation.z = lerp(rnd(-0.02, 0.02) + p.holder.rotation.z, target.rot, e);
+      p.holder.rotation.x = (1 - e) * 2.4;
+      p.holder.rotation.y = (1 - e) * 3.1;
+      p.holder.scale.setScalar(target.scale * (0.55 + e * 0.45));
+
+      // trail
+      for (let k = 0; k < 3; k++)
+        particle(p.holder.position, new THREE.Vector3(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)),
+          { life: rnd(0.15, 0.45), size: rnd(2, 6), drag: 0.1 });
+
+      if (p.t >= 1) {
+        p.seated = true;
+        seatedAt.set(p.id, time);
+        sfx.seat(i / suit.pieces.length);
+        ring(target.pos, 0.5);
+        flash = Math.max(flash, 0.12);
+        shake = Math.max(shake, 5);
+        for (let k = 0; k < 24; k++)
+          particle(target.pos, new THREE.Vector3(rnd(-3, 3), rnd(-3, 3), rnd(-3, 3)),
+            { life: rnd(0.2, 0.5), size: rnd(2, 6), drag: 0.05 });
+      }
+    } else {
+      // seated: ride the body
+      p.holder.position.lerp(target.pos, 1 - Math.pow(0.0008, dt));
+      p.holder.rotation.x = lerp(p.holder.rotation.x, 0, 1 - Math.pow(0.01, dt));
+      p.holder.rotation.y = lerp(p.holder.rotation.y, 0, 1 - Math.pow(0.01, dt));
+      p.holder.rotation.z = lerp(p.holder.rotation.z, target.rot, 1 - Math.pow(0.004, dt));
+      p.holder.scale.lerp(new THREE.Vector3().setScalar(target.scale), 1 - Math.pow(0.01, dt));
+    }
+  });
+
+  if (phase === 'assembling' && allSeated) {
+    phase = 'booting';
+    bootTime = 0;
+    sfx.boot();
+  }
+  if (phase === 'booting') {
+    bootTime += dt;
+    // eyes come up as the helmet closes
+    const k = clamp(bootTime / 1.3, 0, 1);
+    if (helmetPiece.object.userData.eyes) {
+      for (const e of helmetPiece.object.userData.eyes.children)
+        e.material.opacity = k * (0.75 + 0.25 * Math.sin(time * 18));
+    }
+    if (bootTime > 1.5) { phase = 'online'; sfx.online(); }
+  }
+
+  // arc reactor pulse + the light it throws
+  const core = chestPiece.object.userData.reactorCore;
+  if (core) {
+    const pulse = 0.72 + 0.28 * Math.sin(time * 3.2);
+    core.material.opacity = chestPiece.seated ? pulse : 0.2;
+    core.scale.setScalar(0.95 + pulse * 0.1);
+  }
+  if (chestPiece.seated) {
+    reactorLight.position.copy(chestPiece.holder.position).add(new THREE.Vector3(0, 0.1, 0.5));
+    reactorLight.intensity = 1.4 + Math.sin(time * 3.2) * 0.35;
+  }
+}
+
+// ================================================================
+// SUIT-UP TRIGGER — arms out wide, held
+// ================================================================
+const poseGate = new Gate({ enter: 0.6, exit: 0.35, hold: 0.55, release: 0.3 });
+
+function suitUpConfidence(pose) {
+  if (!pose) return 0;
+  const ls = pose[POSE.leftShoulder], rs = pose[POSE.rightShoulder];
+  const lw = pose[POSE.leftWrist], rw = pose[POSE.rightWrist];
+  const lh = pose[POSE.leftHip];
+  if (!ls || !rs || !lw || !rw || !lh) return 0;
+  if ((lw.visibility ?? 1) < 0.5 || (rw.visibility ?? 1) < 0.5) return 0;
+
+  const shoulderW = Math.abs(ls.x - rs.x) || 1e-3;
+  const cx = (ls.x + rs.x) / 2;
+  // both wrists well outside the shoulders…
+  const outL = conf(Math.abs(lw.x - cx) / shoulderW, 0.75, 1.25);
+  const outR = conf(Math.abs(rw.x - cx) / shoulderW, 0.75, 1.25);
+  // …and roughly level with the shoulders, not hanging down
+  const highL = conf((lh.y - lw.y) / Math.max(lh.y - ls.y, 1e-3), 0.55, 0.95);
+  const highR = conf((lh.y - rw.y) / Math.max(lh.y - ls.y, 1e-3), 0.55, 0.95);
+  return outL * outR * Math.min(highL, highR);
+}
+
+// ================================================================
+// REPULSORS
+// ================================================================
+const units = new Map();
+const makeUnit = () => ({
+  charge: 0, cool: 0, prevScale: null, push: 0, ready: false,
+  gate: new Gate({ enter: 0.62, exit: 0.4, hold: 0.12, release: 0.18 }),
+  parts: {}, pos: new THREE.Vector3(), light: null,
+});
+
+/**
+ * A raised palm, square to the camera. Deliberately not "any open palm" —
+ * the hand has to be lifted, which is what stops it firing while you gesture.
+ */
+function repulsorConfidence(lm, o, pose, key) {
+  const open = conf(spread(lm), 1.35, 1.7);
+  const toward = conf(o.facing, 0.2, 0.6);
+  const solid = conf(o.planarity, 0.25, 0.5);
+
+  let raised = 0.6;                       // no body yet: allow, but not strongly
+  if (pose) {
+    const wrist = key === 'Left' ? pose[POSE.leftWrist] : pose[POSE.rightWrist];
+    const elbow = key === 'Left' ? pose[POSE.leftElbow] : pose[POSE.rightElbow];
+    const sh = key === 'Left' ? pose[POSE.leftShoulder] : pose[POSE.rightShoulder];
+    if (wrist && elbow && sh) {
+      const span = Math.max(Math.abs(sh.y - elbow.y), 1e-3);
+      raised = conf((elbow.y - wrist.y) / span, 0.1, 0.7);
+    }
+  }
+  return { open, toward, solid, raised,
+    value: open * toward * raised * (0.4 + solid * 0.6) };
+}
+
+function updateRepulsors(hands, pose, dt, time) {
+  const seen = new Set();
+
+  for (const { key, lm, o } of hands) {
+    seen.add(key);
+    let u = units.get(key);
+    if (!u) {
+      u = makeUnit();
+      u.light = new THREE.PointLight(0x7fd8ff, 0, 6, 2);
+      scene.add(u.light);
+      units.set(key, u);
+    }
+
+    const p = tracker.toNDC(palmCenter(lm));
+    const w = worldAt(p.x, p.y, 0.6);
+    u.pos.lerp(w, 1 - Math.pow(0.004, dt));
+
+    const scale = handScale(lm);
+    u.push = u.prevScale === null ? 0
+      : (scale - u.prevScale) / Math.max(dt, 1e-3) / Math.max(scale, 1e-4);
+    u.prevScale = scale;
+    u.cool = Math.max(0, u.cool - dt);
+
+    const cf = repulsorConfidence(lm, o, pose, key);
+    u.parts = cf;
+    const armed = u.gate.update(cf.value, dt);
+
+    if (isFist(lm) || o.palmAway) {
+      u.charge = Math.max(0, u.charge - dt * 3);
+      u.ready = false;
+    } else if (armed && u.cool === 0) {
+      u.charge = clamp(u.charge + dt / CHARGE_TIME, 0, 1);
+      if (u.charge > 0.995 && !u.ready) { u.ready = true; sfx.ready(); }
+
+      // motes spiralling into the palm
+      if (Math.random() < 60 * dt * (0.3 + u.charge)) {
+        const a = rnd(0, Math.PI * 2), r = 0.5 + Math.random() * 0.8;
+        const from = u.pos.clone().add(new THREE.Vector3(Math.cos(a) * r, Math.sin(a) * r, rnd(-0.3, 0.3)));
+        const v = u.pos.clone().sub(from).multiplyScalar(2.2);
+        particle(from, v, { life: rnd(0.25, 0.5), size: rnd(2, 5), drag: 0.6 });
+      }
+
+      if (u.charge >= MIN_FIRE && o.facing > 0.2 && u.push > PUSH_FIRE) fire(u, key);
+    } else {
+      u.charge = Math.max(0, u.charge - dt * 1.5);
+    }
+
+    // emitter glow on the gauntlet, if that piece is seated
+    const g = gauntlets[key];
+    if (g?.seated && g.object.userData.emitter) {
+      g.object.userData.emitter.material.opacity = u.charge;
+    }
+    u.light.position.copy(u.pos);
+    u.light.intensity = u.charge * 2.2;
+  }
+
+  for (const [key, u] of units) {
+    if (seen.has(key)) continue;
+    u.gate.reset();
+    u.charge = Math.max(0, u.charge - dt * 2.5);
+    u.light.intensity = u.charge * 2.2;
+    if (u.charge <= 0) { scene.remove(u.light); units.delete(key); }
+  }
+}
+
+const beams = [];
+function fire(u, key) {
+  const power = u.charge;
+  beams.push({ pos: u.pos.clone(), age: 0, life: 0.42 + power * 0.3, power });
+  ring(u.pos, 0.8 + power);
+  for (let i = 0; i < Math.floor(90 * (0.4 + power)); i++) {
+    const a = rnd(0, Math.PI * 2), sp = rnd(2, 12) * (0.4 + power);
+    particle(u.pos, new THREE.Vector3(Math.cos(a) * sp, Math.sin(a) * sp, rnd(2, 9)),
+      { life: rnd(0.2, 0.5), size: rnd(2, 7), drag: 0.05 });
+  }
+  flash = Math.max(flash, 0.4 + power * 0.4);
+  shake = Math.max(shake, 26 * (0.4 + power));
+  ca = Math.max(ca, 0.4 * (0.4 + power));
+
+  // recoil: the gauntlet kicks back along the arm
+  const g = gauntlets[key];
+  if (g?.seated) g.holder.position.z -= 0.35 * (0.4 + power);
+
+  sfx.fire(power);
+  u.charge = 0; u.ready = false; u.cool = COOLDOWN;
+}
+
+const beamGeo = new THREE.CylinderGeometry(1, 1, 1, 24, 1, true);
+const beamMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uFade: { value: 1 }, uPower: { value: 1 } },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    varying vec2 vUv;
+    uniform float uTime, uFade, uPower;
+    void main(){
+      float across = 1.0 - abs(vUv.x*2.0 - 1.0);
+      float core = pow(across, 6.0);
+      float sheath = pow(across, 1.6);
+      float ripple = 1.0 + 0.16*sin(vUv.y*60.0 - uTime*40.0);
+      float a = (core*1.5 + sheath*0.5) * ripple * uFade;
+      vec3 col = mix(vec3(0.25,0.65,1.0), vec3(1.0), core);
+      gl_FragColor = vec4(col * a * 1.6, a);
+    }`,
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+  side: THREE.DoubleSide,
+});
+const beamMeshes = [];
+function updateBeams(dt, time) {
+  while (beamMeshes.length < beams.length) {
+    const m = new THREE.Mesh(beamGeo, beamMat.clone());
+    scene.add(m);
+    beamMeshes.push(m);
+  }
+  beamMeshes.forEach((m, i) => { m.visible = i < beams.length; });
+
+  for (let i = beams.length - 1; i >= 0; i--) {
+    const b = beams[i];
+    b.age += dt;
+    if (b.age > b.life) { beams.splice(i, 1); continue; }
+    const k = b.age / b.life;
+    const fade = k < 0.12 ? k / 0.12 : Math.pow(1 - (k - 0.12) / 0.88, 1.5);
+    const m = beamMeshes[i];
+    if (!m) continue;
+    // the blast travels toward the viewer, so it is drawn along +z
+    const len = 14;
+    m.position.copy(b.pos).add(new THREE.Vector3(0, 0, len / 2));
+    m.rotation.set(Math.PI / 2, 0, 0);
+    m.scale.set((0.12 + b.power * 0.26) * (0.6 + k * 1.6), len, (0.12 + b.power * 0.26) * (0.6 + k * 1.6));
+    m.material.uniforms.uTime.value = time;
+    m.material.uniforms.uFade.value = fade;
+    m.material.uniforms.uPower.value = b.power;
+  }
+}
+
+// ================================================================
+// AUDIO
+// ================================================================
+const A = { ctx: null, on: false, muted: false, master: null, verb: null, noise: null,
+            whine: null, whineGain: null };
+
+function initAudio() {
+  if (A.ctx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  const c = new AC(); A.ctx = c;
+  const master = c.createGain(); master.gain.value = 0.85;
+  const comp = c.createDynamicsCompressor();
+  comp.threshold.value = -15; comp.ratio.value = 7; comp.attack.value = 0.004;
+  master.connect(comp).connect(c.destination);
+  A.master = master;
+
+  const len = Math.floor(c.sampleRate * 1.5);
+  const ir = c.createBuffer(2, len, c.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = ir.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.6);
+  }
+  const conv = c.createConvolver(); conv.buffer = ir;
+  const verb = c.createGain(); verb.gain.value = 0.3;
+  verb.connect(conv).connect(master);
+  A.verb = verb;
+
+  const nlen = Math.floor(c.sampleRate * 2);
+  const nb = c.createBuffer(1, nlen, c.sampleRate);
+  const nd = nb.getChannelData(0);
+  let b0 = 0, b1 = 0;
+  for (let i = 0; i < nlen; i++) {
+    const wn = Math.random() * 2 - 1;
+    b0 = 0.997 * b0 + wn * 0.099; b1 = 0.963 * b1 + wn * 0.297;
+    nd[i] = (b0 + b1 + wn * 0.2) * 0.3;
+  }
+  A.noise = nb;
+
+  const o1 = c.createOscillator(); o1.type = 'sawtooth'; o1.frequency.value = 200;
+  const o2 = c.createOscillator(); o2.type = 'square'; o2.frequency.value = 302;
+  const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 5;
+  const g = c.createGain(); g.gain.value = 0;
+  o1.connect(bp); o2.connect(bp); bp.connect(g);
+  g.connect(master); g.connect(verb);
+  o1.start(); o2.start();
+  A.whine = { o1, o2, bp }; A.whineGain = g;
+
+  A.on = true;
+  soundBtn.classList.add('gone');
+}
+
+function hit({ dur = 0.25, gain = 0.4, f0 = 1200, f1 = 300, type = 'bandpass',
+               Q = 1, verb = 0.3, delay = 0 } = {}) {
+  if (!A.on || A.muted) return;
+  const c = A.ctx, t = c.currentTime + delay;
+  const src = c.createBufferSource(); src.buffer = A.noise;
+  src.playbackRate.value = 0.8 + Math.random() * 0.5;
+  const f = c.createBiquadFilter(); f.type = type; f.Q.value = Q;
+  f.frequency.setValueAtTime(f0, t);
+  f.frequency.exponentialRampToValueAtTime(Math.max(f1, 20), t + dur);
+  const g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f).connect(g); g.connect(A.master);
+  const v = c.createGain(); v.gain.value = verb; g.connect(v).connect(A.verb);
+  src.start(t); src.stop(t + dur + 0.05);
+}
+
+function tone({ f0 = 400, f1 = 120, dur = 0.4, gain = 0.3, wave = 'sine',
+                verb = 0.3, delay = 0 } = {}) {
+  if (!A.on || A.muted) return;
+  const c = A.ctx, t = c.currentTime + delay;
+  const o = c.createOscillator(); o.type = wave;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(f1, 10), t + dur);
+  const g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(A.master);
+  const v = c.createGain(); v.gain.value = verb; g.connect(v).connect(A.verb);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+const sfx = {
+  launch() { tone({ f0: 90, f1: 240, dur: 0.6, gain: 0.3, wave: 'sawtooth' });
+             hit({ dur: 0.5, gain: 0.3, f0: 400, f1: 2200, Q: 0.9 }); },
+  // metal seating: a bright clack over a low thunk, pitched up as the suit builds
+  seat(p)  { hit({ dur: 0.07, gain: 0.42, f0: 2600 + p * 2400, f1: 1400, type: 'bandpass', Q: 3 });
+             tone({ f0: 260 + p * 200, f1: 70, dur: 0.18, gain: 0.3, wave: 'square' });
+             hit({ dur: 0.22, gain: 0.16, f0: 900, f1: 200, type: 'lowpass', Q: 1, delay: 0.01 }); },
+  boot()   { tone({ f0: 220, f1: 880, dur: 0.9, gain: 0.16, wave: 'triangle', verb: 0.5 });
+             hit({ dur: 0.8, gain: 0.18, f0: 500, f1: 3000, Q: 0.8, verb: 0.6 }); },
+  online() { tone({ f0: 1320, f1: 1320, dur: 0.14, gain: 0.09, wave: 'sine' });
+             tone({ f0: 1980, f1: 1980, dur: 0.12, gain: 0.06, wave: 'sine', delay: 0.1 }); },
+  ready()  { tone({ f0: 1240, f1: 1240, dur: 0.12, gain: 0.08, wave: 'sine' }); },
+  fire(p)  { const g = 0.5 + p * 0.5;
+             tone({ f0: 1900, f1: 150, dur: 0.3, gain: 0.32 * g, wave: 'sawtooth' });
+             hit({ dur: 0.3, gain: 0.55 * g, f0: 4200, f1: 380, type: 'lowpass', Q: 1.1 });
+             tone({ f0: 115, f1: 32, dur: 0.6, gain: 0.8 * g, wave: 'sine' });
+             hit({ dur: 1.0, gain: 0.18 * g, f0: 1300, f1: 280, Q: 1.5, verb: 0.7, delay: 0.05 }); },
+};
+
+// ================================================================
+// JARVIS HUD (2D overlay)
+// ================================================================
+function drawHUD(hands, pose, time) {
+  const S = Math.max(uiCanvas.width, uiCanvas.height) / 1400;
+  const boot = phase === 'booting' ? clamp(bootTime / 1.5, 0, 1)
+             : phase === 'online' ? 1 : 0;
+  if (boot <= 0.001) return;
+
+  const cw = uiCanvas.width, ch = uiCanvas.height;
+  uictx.save();
+  uictx.globalAlpha = boot;
+
+  // --- corner chrome
+  const m = 30 * S, arm = 70 * S;
+  uictx.strokeStyle = 'rgba(120,215,255,.5)';
+  uictx.lineWidth = 1.4 * S;
+  for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+    const x = sx < 0 ? m : cw - m, y = sy < 0 ? m : ch - m;
+    const grow = arm * boot;
+    uictx.beginPath();
+    uictx.moveTo(x, y - sy * grow);
+    uictx.lineTo(x, y);
+    uictx.lineTo(x - sx * grow, y);
+    uictx.stroke();
+  }
+
+  // --- scan sweep
+  const sy2 = ((time * 0.18) % 1) * ch;
+  const g = uictx.createLinearGradient(0, sy2 - 60 * S, 0, sy2 + 60 * S);
+  g.addColorStop(0, 'rgba(90,190,255,0)');
+  g.addColorStop(0.5, 'rgba(130,220,255,.10)');
+  g.addColorStop(1, 'rgba(90,190,255,0)');
+  uictx.fillStyle = g;
+  uictx.fillRect(0, sy2 - 60 * S, cw, 120 * S);
+
+  // --- targeting brackets on everything the tracker sees
+  const bracket = (cx, cy, r, label, sub) => {
+    const b = r;
+    uictx.strokeStyle = 'rgba(140,225,255,.85)';
+    uictx.lineWidth = 1.6 * S;
+    for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      uictx.beginPath();
+      uictx.moveTo(cx + sx * b, cy + sy * b - sy * b * 0.42);
+      uictx.lineTo(cx + sx * b, cy + sy * b);
+      uictx.lineTo(cx + sx * b - sx * b * 0.42, cy + sy * b);
+      uictx.stroke();
+    }
+    uictx.strokeStyle = 'rgba(120,215,255,.28)';
+    uictx.setLineDash([5 * S, 9 * S]);
+    uictx.lineDashOffset = -time * 40 * S;
+    uictx.beginPath(); uictx.arc(cx, cy, b * 1.16, 0, Math.PI * 2); uictx.stroke();
+    uictx.setLineDash([]);
+    uictx.fillStyle = 'rgba(150,225,255,.9)';
+    uictx.font = `${11 * dpr}px ui-monospace,Consolas,monospace`;
+    uictx.textAlign = 'left';
+    uictx.fillText(label, cx + b * 1.25, cy - b * 0.2);
+    if (sub) {
+      uictx.fillStyle = 'rgba(150,225,255,.55)';
+      uictx.fillText(sub, cx + b * 1.25, cy + b * 0.05);
+    }
+  };
+
+  for (const h of hands) {
+    const p = tracker.toScreen(palmCenter(h.lm), cw, ch);
+    const r = handScale(h.lm) * ch * 1.5;
+    const u = units.get(h.key);
+    bracket(p.x, p.y, r, `${h.key.toUpperCase()} HAND`,
+      u ? `PWR ${(u.charge * 100).toFixed(0).padStart(3, '0')}%` : 'IDLE');
+
+    if (u && u.charge > 0.02) {
+      uictx.strokeStyle = `rgba(190,240,255,${0.5 + u.charge * 0.5})`;
+      uictx.lineWidth = 3.4 * S;
+      uictx.beginPath();
+      uictx.arc(p.x, p.y, r * 1.42, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * u.charge);
+      uictx.stroke();
+    }
+  }
+
+  if (pose) {
+    const nose = pose[POSE.nose];
+    const le = pose[POSE.leftEar], re = pose[POSE.rightEar];
+    if (nose && le && re && (nose.visibility ?? 1) > 0.5) {
+      const p = tracker.toScreen(nose, cw, ch);
+      const r = Math.hypot((le.x - re.x) * cw, (le.y - re.y) * ch) * 0.85;
+      bracket(p.x, p.y, r, 'TARGET · HOSTILE?', 'SCANNING');
+    }
+  }
+
+  // --- readouts
+  uictx.fillStyle = 'rgba(130,215,255,.55)';
+  uictx.font = `${11.5 * dpr}px ui-monospace,Consolas,monospace`;
+  uictx.textAlign = 'left';
+  const lines = [
+    `MARK VII · ${phase === 'online' ? 'ALL SYSTEMS NOMINAL' : 'INITIALISING'}`,
+    `ARC REACTOR   ${(88 + Math.sin(time) * 4).toFixed(1)}%`,
+    `REPULSORS     ${[...units.values()].filter(u => u.charge > 0.02).length} ACTIVE`,
+    `TRACKING      ${pose ? 'BODY LOCK' : 'NO BODY'} · ${hands.length} HAND${hands.length === 1 ? '' : 'S'}`,
+  ];
+  lines.forEach((l, i) => uictx.fillText(l, m + 14 * S, m + (26 + i * 17) * S));
+
+  uictx.textAlign = 'right';
+  uictx.fillText(new Date().toLocaleTimeString(), cw - m - 14 * S, m + 26 * S);
+  uictx.fillText(`ALT ${(1200 + Math.sin(time * 0.7) * 40).toFixed(0)} FT`, cw - m - 14 * S, m + 43 * S);
+
+  uictx.restore();
+}
+
+// ================================================================
+// FRAME
+// ================================================================
+function frame(hands, dt, time, extra) {
+  const pose = extra?.pose || null;
+
+  // suit-up trigger
+  const conf0 = suitUpConfidence(pose);
+  const wantSuit = poseGate.update(conf0, dt);
+  if (wantSuit && phase === 'idle') startSuitUp();
+
+  updateSuit(pose, dt, time);
+  updateRepulsors(hands, pose, dt, time);
+  updateBeams(dt, time);
+  updateParticles(dt);
+  updateRings(dt);
+  pMat.uniforms.uTime.value = time;
+
+  // Recoil recovers on its own: the seated-piece tracking in updateSuit()
+  // pulls the gauntlet back toward the arm each frame.
+
+  // --- camera feed + spill from reactor and both palms
+  const video = tracker?.video;
+  if (showCam && video && video.readyState >= 2) {
+    if (!bgMat.uniforms.uTex.value) {
+      const tex = new THREE.VideoTexture(video);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      bgMat.uniforms.uTex.value = tex;
+    }
+    bgMat.uniforms.uHas.value = 1;
+    bgMat.uniforms.uVideoAspect.value = video.videoWidth / video.videoHeight;
+    bgMat.uniforms.uMirror.value = tracker.state.mirror ? 1 : 0;
+  } else bgMat.uniforms.uHas.value = 0;
+
+  const setSpill = (uniform, worldPos, strength) => {
+    if (!worldPos) { uniform.value.z = lerp(uniform.value.z, 0, 0.1); return; }
+    const s = worldPos.clone().project(camera);
+    uniform.value.set(s.x * 0.5 + 0.5, s.y * 0.5 + 0.5,
+      lerp(uniform.value.z, strength, 0.2));
+  };
+  setSpill(bgMat.uniforms.uL1,
+    chestPiece.seated ? chestPiece.holder.position : null, 0.55);
+  const us = [...units.values()];
+  setSpill(bgMat.uniforms.uL2, us[0]?.pos, (us[0]?.charge || 0) * 1.1);
+  setSpill(bgMat.uniforms.uL3, us[1]?.pos, (us[1]?.charge || 0) * 1.1);
+
+  // --- post
+  const flying = phase === 'assembling' || beams.length > 0;
+  afterimage.uniforms.damp.value = lerp(afterimage.uniforms.damp.value,
+    flying ? 0.62 : 0.0, 1 - Math.pow(0.02, dt));
+  finalPass.uniforms.uTime.value = time;
+  finalPass.uniforms.uCA.value = ca;
+  finalPass.uniforms.uFlash.value = flash;
+  finalPass.uniforms.uScan.value = phase === 'online' || phase === 'booting' ? 1 : 0;
+  shakeT += dt;
+  finalPass.uniforms.uShake.value.set(
+    Math.sin(shakeT * 61) * shake / W, Math.cos(shakeT * 47) * shake / H);
+  flash *= Math.pow(0.003, dt);
+  ca *= Math.pow(0.01, dt);
+  shake *= Math.pow(0.0015, dt);
+
+  if (A.on && A.whineGain) {
+    const top = Math.max(0, ...[...units.values()].map(u => u.charge));
+    const c = A.ctx.currentTime;
+    A.whineGain.gain.setTargetAtTime(A.muted ? 0 : top * 0.05, c, 0.08);
+    A.whine.o1.frequency.setTargetAtTime(190 + top * 560, c, 0.1);
+    A.whine.o2.frequency.setTargetAtTime(287 + top * 820, c, 0.1);
+    A.whine.bp.frequency.setTargetAtTime(760 + top * 1900, c, 0.1);
+  }
+
+  composer.render();
+
+  // --- overlays
+  uictx.setTransform(1, 0, 0, 1, 0, 0);
+  uictx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+  drawHUD(hands, pose, time);
+  if (showDebug) {
+    drawHandDebug(uictx, {
+      hands,
+      toScreen: (p, w, h) => ({ x: (tracker.state.mirror ? 1 - p.x : p.x) * w, y: p.y * h }),
+      W: uiCanvas.width, H: uiCanvas.height, dpr,
+      checks: h => {
+        const u = units.get(h.key);
+        const p = u?.parts || {};
+        return [
+          { label: 'palm open',   pass: (p.open ?? 0) > 0.5,   value: (p.open ?? 0).toFixed(2) },
+          { label: 'palm → cam',  pass: (p.toward ?? 0) > 0.5, value: h.o.facing.toFixed(2) },
+          { label: 'hand raised', pass: (p.raised ?? 0) > 0.5, value: (p.raised ?? 0).toFixed(2) },
+          { label: 'armed',       pass: !!u?.gate.active,      value: (p.value ?? 0).toFixed(2) },
+          { label: 'push to fire', pass: (u?.push ?? 0) > PUSH_FIRE,
+            value: `${(u?.push ?? 0).toFixed(2)}/${PUSH_FIRE}` },
+        ];
+      },
+    });
+    uictx.fillStyle = '#8fdcff';
+    uictx.font = `${12 * dpr}px ui-monospace,Consolas,monospace`;
+    uictx.textAlign = 'left';
+    uictx.fillText(`phase ${phase}  suit-up conf ${conf0.toFixed(2)}  ` +
+      `seated ${suit.pieces.filter(p => p.seated).length}/${suit.pieces.length}`,
+      16 * dpr, uiCanvas.height - 20 * dpr);
+  }
+
+  statusEl.textContent =
+    phase === 'assembling' ? 'assembling…' :
+    phase === 'booting'    ? 'systems online' :
+    phase === 'online'     ? ([...units.values()].some(u => u.ready) ? 'ready — push to fire'
+                            : [...units.values()].some(u => u.charge > 0.02) ? 'charging…'
+                            : 'mark vii online') :
+    !pose                  ? 'step into frame' :
+    conf0 > 0.15           ? 'hold it…' : 'arms out wide to suit up';
+}
+
+// ================================================================
+// INPUT + BOOT
+// ================================================================
+addEventListener('keydown', e => {
+  initAudio();
+  const k = e.key.toLowerCase();
+  if (k === 'f') {
+    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  } else if (k === 'h') document.getElementById('hud').classList.toggle('hidden');
+  else if (k === 'c') showCam = !showCam;
+  else if (k === 'd') showDebug = !showDebug;
+  else if (k === 'r') resetSuit();
+  else if (k === 'm') { A.muted = !A.muted; if (A.master) A.master.gain.value = A.muted ? 0 : 0.85; }
+  else if (k === ' ') { e.preventDefault(); startSuitUp(); }
+});
+addEventListener('pointerdown', initAudio);
+soundBtn.addEventListener('click', initAudio);
+
+tracker = await createTracker({
+  numHands: 2, pose: true, bootText: 'Bringing the suit online…',
+});
+tracker.onFrame(frame);
+</script>
+</body>
+</html>

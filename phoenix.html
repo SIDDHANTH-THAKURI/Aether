@@ -70,6 +70,7 @@
 <script type="module">
 import { FilesetResolver, HandLandmarker }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import { orientation, Gate, conf, drawHandDebug } from './handtrack.js';
 
 // ================================================================
 // GESTURE DETECTION — unchanged
@@ -104,10 +105,22 @@ const makeHand = () => ({
   fingerTip: { x: 0, y: 0 },
   vel: { vx: 0, vy: 0 }, prevPalm: null, velHist: [],
   lostFor: 0, seed: Math.random() * 100,
+  // orientation gating: a gesture only counts from a plausible hand pose
+  o: null, palmGate: new Gate({ enter: 0.6, exit: 0.36, hold: 0.08, release: 0.16 }),
+  palmConf: { open: 0, toward: 0, solid: 0, value: 0 }, snapOK: 0,
   // presentation-only extras
   orbit: Math.random() * 6.28, ringPhase: Math.random() * 6.28,
   maxAnnounced: false, wasHold: false,
 });
+
+// Confidence that this hand is a palm presented to the camera, ready to
+// catch or hold a flame.
+function palmConfidence(lm, o) {
+  const open = conf(spread(lm), OPEN_PALM * 0.9, OPEN_PALM * 1.15);
+  const toward = conf(o.facing, 0.12, 0.5);
+  const solid = conf(o.planarity, 0.22, 0.5);
+  return { open, toward, solid, value: open * toward * (0.4 + solid * 0.6) };
+}
 const H = { Left: makeHand(), Right: makeHand() };
 
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
@@ -170,6 +183,7 @@ function track(dt) {
         throwBall(h, peakVel(h));
       }
       h.prevPalm = null; h.prevGap = null; h.snapPrimed = false; h.velHist = [];
+      h.palmGate.reset();
       if ((h.state === 'SPARK' || h.state === 'HOLD') && h.lostFor > 1.2) reset(h);
       continue;
     }
@@ -196,12 +210,22 @@ function track(dt) {
     h.fingerTip.x = (1 - lm[12].x) * W;
     h.fingerTip.y = lm[12].y * Hh;
 
+    const o = orientation(lm, key);
+    h.o = o;
+    h.palmConf = palmConfidence(lm, o);
+    const palmReady = h.palmGate.update(h.palmConf.value, dt);
+
+    // A snap read off the back of the hand is almost always a tracking
+    // artefact — thumb and middle finger are occluded from that side.
+    h.snapOK = conf(o.facing, -0.35, 0.05);
+
     const gap = dist(lm[4], lm[12]) / s;
     const gapVel = h.prevGap === null ? 0 : (gap - h.prevGap) / Math.max(dt, 1e-3);
     if (gap < SNAP_CLOSE) h.snapPrimed = true;
     if (h.snapPrimed && gap > SNAP_OPEN && gapVel > SNAP_SPEED) {
       h.snapPrimed = false;
-      if (h.state === 'IDLE' || h.state === 'THROWN') ignite(h);
+      if ((h.state === 'IDLE' || h.state === 'THROWN') && h.snapOK > 0.4 && o.planarity > 0.15)
+        ignite(h);
     }
     h.prevGap = gap;
 
@@ -209,15 +233,17 @@ function track(dt) {
 
     if (h.state === 'SPARK') {
       h.sparkAge += dt;
-      if (open > OPEN_PALM) { h.state = 'HOLD'; h.hold = 0.05; onCatch(h); }
+      if (palmReady) { h.state = 'HOLD'; h.hold = 0.05; onCatch(h); }
       else if (h.sparkAge > SPARK_WINDOW) reset(h);
     } else if (h.state === 'HOLD') {
       h.hold = clamp(h.hold + dt / GROW_TIME, 0, 1);
       const peak = peakVel(h);
       const speed = speedOf(peak);
 
-      if (speed > THROW_SPEED && h.hold > 0.18) throwBall(h, peak);
-      else if (open < OPEN_PALM * 0.7 && speed < THROW_SPEED * 0.4) reset(h);
+      // Throwing needs the palm still roughly toward the camera; a hand that
+      // has rotated away is putting the flame out, not launching it.
+      if (speed > THROW_SPEED && h.hold > 0.18 && o.facing > 0.05) throwBall(h, peak);
+      else if ((open < OPEN_PALM * 0.7 || o.palmAway) && speed < THROW_SPEED * 0.4) reset(h);
     }
   }
 }
@@ -1412,36 +1438,32 @@ function drawUI() {
   }
 
   if (!showDebug) return;
-  uictx.font = `${13 * dpr}px ui-monospace,Consolas,monospace`;
-  let row = 0;
-  for (const key of KEYS) {
-    const h = H[key];
-    const lm = frameHands.find(f => f.key === key);
-    const speed = speedOf(peakVel(h));
-    const open = lm ? spread(lm.lm) : 0;
-    uictx.fillStyle = speed > THROW_SPEED ? '#7dff9b' : (h.has ? '#ffd9a0' : '#8a7565');
-    uictx.fillText(
-      `${key.padEnd(5)} ${h.has ? 'seen' : ' -- '}  ${h.state.padEnd(6)}` +
-      ` hold ${h.hold.toFixed(2)}  flick ${speed.toFixed(2)}/${THROW_SPEED}` +
-      `  spread ${open.toFixed(2)}/${OPEN_PALM}`,
-      16 * dpr, (26 + row++ * 20) * dpr);
-  }
-  uictx.fillStyle = '#8a7565';
-  uictx.fillText(`particles ${pCount}   ${(1000 / frameEMA).toFixed(0)} fps   q ${quality.toFixed(2)}`,
-    16 * dpr, (26 + row * 20) * dpr);
 
-  const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
-                 [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
-  uictx.lineWidth = 2 * dpr;
-  for (const { lm } of frameHands) {
-    uictx.strokeStyle = 'rgba(255,200,120,.6)';
-    for (const [a, b] of BONES) {
-      uictx.beginPath();
-      uictx.moveTo((1 - lm[a].x) * W, lm[a].y * Hh);
-      uictx.lineTo((1 - lm[b].x) * W, lm[b].y * Hh);
-      uictx.stroke();
-    }
-  }
+  drawHandDebug(uictx, {
+    hands: frameHands.map(f => ({ ...f, o: H[f.key]?.o })),
+    toScreen: (p, w, h) => ({ x: (1 - p.x) * w, y: p.y * h }),
+    W, H: Hh, dpr,
+    checks: hand => {
+      const h = H[hand.key];
+      if (!h) return [];
+      const speed = speedOf(peakVel(h));
+      return [
+        { label: 'palm open',      pass: h.palmConf.open > 0.5,   value: h.palmConf.open.toFixed(2) },
+        { label: 'palm → camera',  pass: h.palmConf.toward > 0.5, value: (h.o?.facing ?? 0).toFixed(2) },
+        { label: 'palm gate',      pass: h.palmGate.active,       value: h.palmConf.value.toFixed(2) },
+        { label: 'snap allowed',   pass: h.snapOK > 0.4,          value: h.snapOK.toFixed(2) },
+        { label: 'state',          pass: h.state !== 'IDLE',      value: h.state },
+        { label: 'flick to throw', pass: speed > THROW_SPEED,
+          value: `${speed.toFixed(2)}/${THROW_SPEED}` },
+      ];
+    },
+  });
+
+  uictx.fillStyle = '#8a7565';
+  uictx.font = `${13 * dpr}px ui-monospace,Consolas,monospace`;
+  uictx.fillText(
+    `particles ${pCount}   ${(1000 / frameEMA).toFixed(0)} fps   q ${quality.toFixed(2)}`,
+    16 * dpr, Hh - 20 * dpr);
 }
 
 function loop(now) {

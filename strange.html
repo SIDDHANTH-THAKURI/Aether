@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sanctum — portals &amp; the Eye of Agamotto</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#05060a; overflow:hidden; }
+  canvas { display:block; }
+  #three { position:fixed; inset:0; width:100%; height:100%; }
+  #ui { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; z-index:5; }
+
+  #hud {
+    position:fixed; left:2.6vh; bottom:2.6vh; z-index:30;
+    font:300 clamp(11px,1.5vh,16px)/1.9 system-ui,-apple-system,"Segoe UI",sans-serif;
+    color:rgba(255,226,190,.62); letter-spacing:.1em; text-transform:uppercase;
+    pointer-events:none; transition:opacity .8s ease; text-shadow:0 0 14px rgba(0,0,0,.95);
+  }
+  #hud.hidden { opacity:0; }
+  #hud b { color:#ffb347; font-weight:500; }
+  #hud.eye b { color:#5dffa8; }
+
+  #mode {
+    position:fixed; left:50%; top:3vh; transform:translateX(-50%); z-index:30;
+    display:flex; gap:.5rem; pointer-events:none;
+  }
+  .tab {
+    font:400 clamp(9px,1.2vh,12px)/1 system-ui,sans-serif; letter-spacing:.3em;
+    text-transform:uppercase; padding:.75em 1.4em; border-radius:2em;
+    border:1px solid rgba(255,255,255,.14); color:rgba(255,255,255,.45);
+    background:rgba(10,8,16,.5); backdrop-filter:blur(8px); transition:all .35s ease;
+  }
+  .tab.on { color:#0f0a04; background:#ffb347; border-color:#ffb347; font-weight:600; }
+  .tab.on.green { background:#5dffa8; }
+
+  #status {
+    position:fixed; left:50%; top:9.5vh; transform:translateX(-50%); z-index:30;
+    font:300 clamp(11px,1.7vh,19px)/1.4 system-ui,sans-serif;
+    color:rgba(255,236,214,.8); letter-spacing:.42em; text-transform:uppercase;
+    pointer-events:none; text-shadow:0 0 24px rgba(255,140,30,.9); white-space:nowrap;
+  }
+  #status.green { color:rgba(220,255,238,.85); text-shadow:0 0 24px rgba(60,255,150,.9); }
+
+  #sound {
+    position:fixed; left:50%; bottom:2.6vh; transform:translateX(-50%); z-index:30;
+    font:400 clamp(10px,1.3vh,14px)/1.6 system-ui,sans-serif; color:#ffca8a;
+    letter-spacing:.2em; text-transform:uppercase; cursor:pointer;
+    background:rgba(40,18,0,.5); border:1px solid rgba(255,170,70,.38);
+    padding:.65em 1.15em; border-radius:2em; backdrop-filter:blur(6px);
+    transition:opacity .5s ease;
+  }
+  #sound.gone { opacity:0; pointer-events:none; }
+</style>
+</head>
+<body>
+
+<canvas id="three"></canvas>
+<canvas id="ui"></canvas>
+
+<div id="mode">
+  <div class="tab on" id="tab-portal">1 · Portals</div>
+  <div class="tab green" id="tab-eye">2 · Eye of Agamotto</div>
+</div>
+<div id="status"></div>
+<div id="sound">click for sound</div>
+<div id="hud"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+import { createTracker, palmCenter, handScale, spread, fingersUp, isFist,
+         Gate, conf, drawHandDebug, bodyFrame } from './handtrack.js';
+import { MagicCircle } from './strange/magic.js';
+import { Portal } from './strange/portal.js';
+import { EyeOfAgamotto } from './strange/eye.js';
+import { buildTimeObjects } from './strange/timeobjects.js';
+
+// ================================================================
+// TUNING
+// ================================================================
+const TRACE_WINDOW = 1.6;    // seconds of fingertip history kept while tracing
+const MIN_RADIUS   = 0.05;   // circle must be this fraction of the viewport
+const ROUNDNESS    = 0.45;   // max radius deviation before a stroke is rejected
+const SPIN_SWEEP   = 2.6;    // radians the two-handed circle must sweep to toggle the Eye
+
+const clamp = THREE.MathUtils.clamp;
+const lerp = THREE.MathUtils.lerp;
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+const statusEl = document.getElementById('status');
+const hudEl = document.getElementById('hud');
+const soundBtn = document.getElementById('sound');
+const uiCanvas = document.getElementById('ui');
+const uictx = uiCanvas.getContext('2d');
+
+let mode = 'portal';          // 'portal' | 'eye'
+let showDebug = false, showCam = true;
+let tracker = null, W = 1, H = 1, dpr = 1;
+
+// ================================================================
+// RENDERER / SCENE
+// ================================================================
+const renderer = new THREE.WebGLRenderer({
+  canvas: document.getElementById('three'),
+  antialias: true, alpha: false, powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.92;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+camera.position.set(0, 0, 6);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envMap = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environment = envMap;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const key = new THREE.DirectionalLight(0xffffff, 1.1);
+key.position.set(2, 3, 4);
+scene.add(key);
+
+// --- camera feed, drawn behind everything in its own pass
+const bgScene = new THREE.Scene();
+const bgCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const bgMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTex: { value: null }, uHas: { value: 0 }, uMirror: { value: 1 },
+    uVideoAspect: { value: 16 / 9 }, uAspect: { value: 16 / 9 },
+    uWarm: { value: 0 }, uWarmPos: { value: new THREE.Vector2(0.5, 0.5) },
+    uGreen: { value: 0 }, uGreenPos: { value: new THREE.Vector2(0.5, 0.5) },
+  },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.999, 1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform float uHas, uMirror, uVideoAspect, uAspect, uWarm, uGreen;
+    uniform vec2 uWarmPos, uGreenPos;
+    void main(){
+      // cover-fit the video into the viewport
+      vec2 uv = vUv;
+      float s = uVideoAspect / uAspect;
+      if(s > 1.0) uv.x = (uv.x - 0.5) / s + 0.5;
+      else        uv.y = (uv.y - 0.5) * s + 0.5;
+      if(uMirror > 0.5) uv.x = 1.0 - uv.x;
+
+      vec3 c = texture2D(uTex, uv).rgb * uHas;
+      float l = dot(c, vec3(0.299,0.587,0.114));
+      c = mix(vec3(l), c, 0.55);
+      c *= vec3(0.26, 0.25, 0.32);
+      c += vec3(0.012, 0.011, 0.02);
+
+      // light spilling out of whatever magic is open, falling off with distance
+      // and modulated by the scene's own brightness so it reads as reflection
+      vec2 d1 = (vUv - uWarmPos) * vec2(uAspect, 1.0);
+      c += vec3(0.55,0.26,0.06) * exp(-dot(d1,d1)*3.0) * uWarm * (0.35 + l*2.0);
+      vec2 d2 = (vUv - uGreenPos) * vec2(uAspect, 1.0);
+      c += vec3(0.10,0.60,0.30) * exp(-dot(d2,d2)*3.4) * uGreen * (0.35 + l*2.0);
+
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+  depthWrite: false, depthTest: false,
+});
+bgScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bgMat));
+
+// --- post
+const composer = new EffectComposer(renderer);
+const bgPass = new RenderPass(bgScene, bgCam);
+composer.addPass(bgPass);
+const mainPass = new RenderPass(scene, camera);
+mainPass.clear = false;
+composer.addPass(mainPass);
+
+// threshold near 1 so only genuinely emissive things (runes, portal fire,
+// the stone) bloom — a low threshold here was blowing out the whole scene
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.55, 0.45, 0.92);
+composer.addPass(bloom);
+
+// Final grade: chromatic aberration, a temporal ripple while scrubbing, vignette.
+const finalPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 }, uCA: { value: 0 }, uWarp: { value: 0 },
+    uWarpPos: { value: new THREE.Vector2(0.5, 0.5) }, uAspect: { value: 1 },
+    uFlash: { value: 0 }, uFlashCol: { value: new THREE.Color(1, 0.75, 0.4) },
+  },
+  vertexShader: `varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`,
+  fragmentShader: `
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse;
+    uniform float uTime, uCA, uWarp, uAspect, uFlash;
+    uniform vec2 uWarpPos;
+    uniform vec3 uFlashCol;
+    void main(){
+      vec2 uv = vUv;
+
+      // time-warp ripple: rings pushing out from the object being scrubbed
+      if(uWarp > 0.001){
+        vec2 d = (uv - uWarpPos) * vec2(uAspect, 1.0);
+        float r = length(d);
+        float ring = sin(r*34.0 - uTime*6.0) * exp(-r*3.4);
+        uv += normalize(d + 1e-5) * ring * uWarp * 0.012;
+      }
+
+      vec2 dc = uv - 0.5;
+      float ca = (0.0008 + uCA*0.02) * pow(length(dc)*2.0, 1.6);
+      vec3 col;
+      col.r = texture2D(tDiffuse, uv + dc*ca).r;
+      col.g = texture2D(tDiffuse, uv).g;
+      col.b = texture2D(tDiffuse, uv - dc*ca).b;
+
+      col += uFlashCol * uFlash;
+
+      float vig = smoothstep(1.30, 0.32, length((vUv-0.5)*vec2(uAspect,1.0))*1.62);
+      col *= mix(0.45, 1.0, vig);
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+composer.addPass(finalPass);
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  renderer.setSize(W, H);
+  composer.setSize(W, H);
+  bloom.setSize(W, H);
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  bgMat.uniforms.uAspect.value = W / H;
+  finalPass.uniforms.uAspect.value = W / H;
+  uiCanvas.width = Math.floor(W * dpr);
+  uiCanvas.height = Math.floor(H * dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+/** Screen NDC → a world point on the plane at depth z. */
+function worldAt(nx, ny, z = 0) {
+  const dist = camera.position.z - z;
+  const h = 2 * Math.tan((camera.fov * Math.PI / 180) / 2) * dist;
+  const w = h * camera.aspect;
+  return new THREE.Vector3(nx * w / 2, ny * h / 2, z);
+}
+/** World units spanned by the full viewport height at depth z. */
+function worldHeight(z = 0) {
+  return 2 * Math.tan((camera.fov * Math.PI / 180) / 2) * (camera.position.z - z);
+}
+
+// ================================================================
+// SPARKS (shared by tracing and temporal effects)
+// ================================================================
+const SPARK_MAX = 2200;
+const sparkPos = new Float32Array(SPARK_MAX * 3);
+const sparkSize = new Float32Array(SPARK_MAX);
+const sparkSeed = new Float32Array(SPARK_MAX);
+const sparkCol = new Float32Array(SPARK_MAX * 3);
+const sparkData = [];
+const sparkGeo = new THREE.BufferGeometry();
+sparkGeo.setAttribute('position', new THREE.BufferAttribute(sparkPos, 3));
+sparkGeo.setAttribute('aSize', new THREE.BufferAttribute(sparkSize, 1));
+sparkGeo.setAttribute('aSeed', new THREE.BufferAttribute(sparkSeed, 1));
+sparkGeo.setAttribute('aColor', new THREE.BufferAttribute(sparkCol, 3));
+sparkGeo.setDrawRange(0, 0);
+const sparkMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: `
+    attribute float aSize; attribute float aSeed; attribute vec3 aColor;
+    varying float vSeed; varying vec3 vColor;
+    void main(){
+      vSeed = aSeed; vColor = aColor;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      gl_PointSize = aSize * (320.0 / max(-mv.z, 0.001));
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: `
+    precision highp float;
+    uniform float uTime;
+    varying float vSeed; varying vec3 vColor;
+    void main(){
+      vec2 d = gl_PointCoord - 0.5;
+      float r = dot(d,d)*4.0;
+      if(r > 1.0) discard;
+      float glow = pow(1.0 - r, 2.6);
+      float tw = 0.6 + 0.4*sin(uTime*26.0 + vSeed*40.0);
+      float a = glow * tw;
+      gl_FragColor = vec4(vColor * a * 1.6, a);
+    }`,
+  transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+});
+scene.add(new THREE.Points(sparkGeo, sparkMat));
+
+function spark(p, vel, opts = {}) {
+  if (sparkData.length >= SPARK_MAX) sparkData.shift();
+  sparkData.push({
+    p: p.clone(), v: vel.clone(),
+    life: opts.life ?? rnd(0.4, 1.0), age: 0,
+    size: opts.size ?? rnd(2, 7),
+    drag: opts.drag ?? 0.3, grav: opts.grav ?? -0.9,
+    col: opts.col ?? new THREE.Color(1.0, 0.55, 0.12),
+    seed: Math.random(),
+  });
+}
+
+function updateSparks(dt) {
+  for (let i = sparkData.length - 1; i >= 0; i--) {
+    const s = sparkData[i];
+    s.age += dt;
+    if (s.age > s.life) { sparkData.splice(i, 1); continue; }
+    s.v.y += s.grav * dt;
+    s.v.multiplyScalar(Math.pow(s.drag, dt));
+    s.p.addScaledVector(s.v, dt);
+  }
+  sparkData.forEach((s, i) => {
+    const k = 1 - s.age / s.life;
+    sparkPos[i * 3] = s.p.x; sparkPos[i * 3 + 1] = s.p.y; sparkPos[i * 3 + 2] = s.p.z;
+    sparkSize[i] = s.size * (0.3 + k);
+    sparkSeed[i] = s.seed;
+    sparkCol[i * 3] = s.col.r * k;
+    sparkCol[i * 3 + 1] = s.col.g * k;
+    sparkCol[i * 3 + 2] = s.col.b * k;
+  });
+  sparkGeo.setDrawRange(0, sparkData.length);
+  sparkGeo.attributes.position.needsUpdate = true;
+  sparkGeo.attributes.aSize.needsUpdate = true;
+  sparkGeo.attributes.aSeed.needsUpdate = true;
+  sparkGeo.attributes.aColor.needsUpdate = true;
+}
+
+// ================================================================
+// AUDIO
+// ================================================================
+const A = { ctx: null, on: false, muted: false, master: null, verb: null, noise: null,
+            hum: null, humGain: null, trace: null, traceGain: null, traceFilt: null };
+
+function initAudio() {
+  if (A.ctx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  const c = new AC(); A.ctx = c;
+
+  const master = c.createGain(); master.gain.value = 0.85;
+  const comp = c.createDynamicsCompressor();
+  comp.threshold.value = -15; comp.ratio.value = 7; comp.attack.value = 0.004;
+  master.connect(comp).connect(c.destination);
+  A.master = master;
+
+  const len = Math.floor(c.sampleRate * 2.2);
+  const ir = c.createBuffer(2, len, c.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = ir.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.3);
+  }
+  const conv = c.createConvolver(); conv.buffer = ir;
+  const verb = c.createGain(); verb.gain.value = 0.4;
+  verb.connect(conv).connect(master);
+  A.verb = verb;
+
+  const nlen = Math.floor(c.sampleRate * 2);
+  const nb = c.createBuffer(1, nlen, c.sampleRate);
+  const nd = nb.getChannelData(0);
+  let b0 = 0, b1 = 0;
+  for (let i = 0; i < nlen; i++) {
+    const wn = Math.random() * 2 - 1;
+    b0 = 0.997 * b0 + wn * 0.099; b1 = 0.963 * b1 + wn * 0.297;
+    nd[i] = (b0 + b1 + wn * 0.2) * 0.3;
+  }
+  A.noise = nb;
+
+  // portal ambience while one is open
+  const o1 = c.createOscillator(); o1.type = 'sawtooth'; o1.frequency.value = 56;
+  const o2 = c.createOscillator(); o2.type = 'sine'; o2.frequency.value = 84;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420; lp.Q.value = 3;
+  const hg = c.createGain(); hg.gain.value = 0;
+  o1.connect(lp); o2.connect(lp); lp.connect(hg);
+  hg.connect(master); hg.connect(verb);
+  o1.start(); o2.start();
+  A.hum = lp; A.humGain = hg;
+
+  // sparking bed while tracing
+  const ts = c.createBufferSource(); ts.buffer = nb; ts.loop = true;
+  const tf = c.createBiquadFilter(); tf.type = 'bandpass'; tf.frequency.value = 2400; tf.Q.value = 1.2;
+  const tg = c.createGain(); tg.gain.value = 0;
+  ts.connect(tf).connect(tg); tg.connect(master); tg.connect(verb);
+  ts.start();
+  A.trace = ts; A.traceGain = tg; A.traceFilt = tf;
+
+  A.on = true;
+  soundBtn.classList.add('gone');
+}
+
+function burst({ dur = 0.25, gain = 0.3, f0 = 900, f1 = 300, type = 'bandpass',
+                 Q = 1, verb = 0.35, delay = 0 } = {}) {
+  if (!A.on || A.muted) return;
+  const c = A.ctx, t = c.currentTime + delay;
+  const src = c.createBufferSource(); src.buffer = A.noise;
+  src.playbackRate.value = 0.8 + Math.random() * 0.5;
+  const f = c.createBiquadFilter(); f.type = type; f.Q.value = Q;
+  f.frequency.setValueAtTime(f0, t);
+  f.frequency.exponentialRampToValueAtTime(Math.max(f1, 20), t + dur);
+  const g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f).connect(g); g.connect(A.master);
+  const v = c.createGain(); v.gain.value = verb; g.connect(v).connect(A.verb);
+  src.start(t); src.stop(t + dur + 0.05);
+}
+
+function tone({ f0 = 300, f1 = 120, dur = 0.5, gain = 0.3, wave = 'sine',
+                verb = 0.35, delay = 0 } = {}) {
+  if (!A.on || A.muted) return;
+  const c = A.ctx, t = c.currentTime + delay;
+  const o = c.createOscillator(); o.type = wave;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(f1, 10), t + dur);
+  const g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + 0.015);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(A.master);
+  const v = c.createGain(); v.gain.value = verb; g.connect(v).connect(A.verb);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+const sfx = {
+  tick()    { burst({ dur: 0.05, gain: 0.05, f0: 2800, f1: 1700, Q: 5, verb: 0.25 }); },
+  snap()    { tone({ f0: 74, f1: 220, dur: 0.9, gain: 0.42, wave: 'sawtooth' });
+              burst({ dur: 0.7, gain: 0.42, f0: 320, f1: 3400, Q: 0.8 });
+              burst({ dur: 1.5, gain: 0.2, f0: 1900, f1: 380, Q: 1.6, verb: 0.8, delay: 0.1 });
+              tone({ f0: 920, f1: 1380, dur: 0.35, gain: 0.08, wave: 'triangle', delay: 0.04 }); },
+  close()   { tone({ f0: 230, f1: 46, dur: 0.7, gain: 0.32, wave: 'sawtooth' });
+              burst({ dur: 0.5, gain: 0.24, f0: 2100, f1: 200, Q: 1.2 }); },
+  eyeOpen() { tone({ f0: 180, f1: 520, dur: 0.8, gain: 0.2, wave: 'triangle', verb: 0.6 });
+              tone({ f0: 1320, f1: 1980, dur: 0.5, gain: 0.07, wave: 'sine', delay: 0.06 });
+              burst({ dur: 0.9, gain: 0.22, f0: 600, f1: 2600, Q: 0.9, verb: 0.7 }); },
+  eyeClose(){ tone({ f0: 520, f1: 150, dur: 0.6, gain: 0.16, wave: 'triangle', verb: 0.5 }); },
+  select()  { tone({ f0: 880, f1: 1180, dur: 0.16, gain: 0.06, wave: 'sine', verb: 0.4 }); },
+  scrub(dir){ burst({ dur: 0.12, gain: 0.045, f0: dir > 0 ? 900 : 2400,
+                      f1: dir > 0 ? 2200 : 700, Q: 2.2, verb: 0.5 }); },
+};
+
+// ================================================================
+// MODE 1 — PORTALS
+// ================================================================
+const portal = new Portal({ radius: 1.2, depth: 2.6 });
+scene.add(portal.group);
+
+const traceCircle = new MagicCircle({ radius: 1, seed: 3, color: 0xffa53c });
+traceCircle.group.visible = false;
+scene.add(traceCircle.group);
+
+const portalRing = new MagicCircle({ radius: 1, seed: 11, color: 0xffb457, dense: false });
+portalRing.group.visible = false;
+scene.add(portalRing.group);
+
+const twoFingerGates = new Map();
+const traceGates = new Map();
+let trace = null;
+let flash = 0, flashCol = new THREE.Color(1, 0.75, 0.4), ca = 0;
+
+/** The left-hand "hold" pose: index and middle out, ring and pinky in. */
+function twoFingerConfidence(lm, o) {
+  const f = fingersUp(lm);
+  const shape = (f.index ? 1 : 0) * (f.middle ? 1 : 0) *
+                (!f.ring ? 1 : 0.2) * (!f.pinky ? 1 : 0.25);
+  const notBack = conf(o.facing, -0.55, -0.05);
+  return shape * (0.3 + notBack * 0.7);
+}
+
+/** The drawing hand: index alone, and not showing the back of the hand. */
+function pointConfidence(lm, o) {
+  const f = fingersUp(lm);
+  const shape = (f.index ? 1 : 0) * (!f.middle ? 1 : 0.15) *
+                (!f.ring ? 1 : 0.4) * (!f.pinky ? 1 : 0.4);
+  const notBack = conf(o.facing, -0.55, -0.05);
+  return shape * (0.25 + notBack * 0.75);
+}
+
+const gateFor = (map, k, opts) => {
+  if (!map.has(k)) map.set(k, new Gate(opts));
+  return map.get(k);
+};
+
+function updatePortalMode(hands, dt, time) {
+  // Which hand is holding the pose, and which is drawing?
+  let holder = null, drawer = null;
+  for (const h of hands) {
+    h._two = twoFingerConfidence(h.lm, h.o);
+    h._point = pointConfidence(h.lm, h.o);
+    const twoOn = gateFor(twoFingerGates, h.key,
+      { enter: 0.55, exit: 0.3, hold: 0.10, release: 0.25 }).update(h._two, dt);
+    const pointOn = gateFor(traceGates, h.key,
+      { enter: 0.55, exit: 0.3, hold: 0.06, release: 0.2 }).update(h._point, dt);
+    if (twoOn && !holder) holder = h;
+    else if (pointOn && !drawer) drawer = h;
+  }
+  for (const [k, g] of twoFingerGates) if (!hands.some(h => h.key === k)) g.reset();
+  for (const [k, g] of traceGates) if (!hands.some(h => h.key === k)) g.reset();
+
+  // Tracing requires the holding hand up as well — that is the sling-ring pose.
+  const armed = holder && drawer;
+
+  if (!armed) {
+    if (trace) { trace.idle += dt; if (trace.idle > 0.5) trace = null; }
+    traceCircle.group.visible = false;
+    if (A.on) A.traceGain.gain.setTargetAtTime(0, A.ctx.currentTime, 0.12);
+  } else {
+    const tip = tracker.toNDC(drawer.lm[8]);
+    const p = { x: tip.x, y: tip.y };
+    if (!trace) trace = { pts: [], progress: 0, idle: 0, cx: 0, cy: 0, R: 0, ok: false };
+    trace.idle = 0;
+    trace.pts.push({ ...p, t: time });
+    while (trace.pts.length && time - trace.pts[0].t > TRACE_WINDOW) trace.pts.shift();
+
+    // sparks stream off the drawing fingertip
+    const wp = worldAt(p.x, p.y, 0);
+    for (let i = 0; i < 3; i++)
+      spark(wp, new THREE.Vector3(rnd(-0.6, 0.6), rnd(-0.4, 0.8), rnd(-0.3, 0.3)),
+        { life: rnd(0.25, 0.7), size: rnd(2, 6), grav: -1.4 });
+
+    fitCircle(trace);
+
+    if (trace.ok) {
+      const c = worldAt(trace.cx, trace.cy, 0);
+      const R = trace.R * worldHeight(0) / 2;
+      traceCircle.group.visible = true;
+      traceCircle.group.position.copy(c);
+      traceCircle.group.scale.setScalar(R);
+      traceCircle.update(time, trace.progress, 0.35 + trace.progress * 0.65, 1);
+
+      if (A.on) {
+        A.traceGain.gain.setTargetAtTime(A.muted ? 0 : 0.05 + trace.progress * 0.05,
+          A.ctx.currentTime, 0.08);
+        A.traceFilt.frequency.setTargetAtTime(1600 + trace.progress * 2600,
+          A.ctx.currentTime, 0.1);
+      }
+      if (trace.progress >= 0.995 && !trace.fired) {
+        trace.fired = true;
+        openPortal(c, R);
+      }
+    } else {
+      traceCircle.group.visible = false;
+    }
+  }
+
+  // fist near the portal closes it
+  if (portal.isOpen) {
+    for (const h of hands) {
+      if (!isFist(h.lm)) continue;
+      const pc = tracker.toNDC(palmCenter(h.lm));
+      const w = worldAt(pc.x, pc.y, 0);
+      if (w.distanceTo(portal.group.position) < portal.radius * 1.7) {
+        portal.close();
+        portalRing.group.visible = false;
+        sfx.close();
+        break;
+      }
+    }
+  }
+
+  portal.update(dt, time);
+  if (portal.isOpen) {
+    portalRing.group.visible = true;
+    portalRing.group.position.copy(portal.group.position);
+    portalRing.group.scale.setScalar(portal.radius * 1.35 * (portal.open || 0.001));
+    portalRing.update(time, 1, 0.5 * portal.open, portal.spin);
+  }
+}
+
+/** Fit a circle to the stroke and measure how much of it has been swept. */
+function fitCircle(tr) {
+  if (tr.pts.length < 8) { tr.progress = 0; tr.ok = false; return; }
+  let cx = 0, cy = 0;
+  for (const p of tr.pts) { cx += p.x; cy += p.y; }
+  cx /= tr.pts.length; cy /= tr.pts.length;
+
+  let mean = 0;
+  for (const p of tr.pts) mean += Math.hypot(p.x - cx, p.y - cy);
+  mean /= tr.pts.length;
+
+  let dev = 0;
+  for (const p of tr.pts) dev += Math.abs(Math.hypot(p.x - cx, p.y - cy) - mean);
+  dev /= tr.pts.length;
+
+  tr.cx = cx; tr.cy = cy; tr.R = mean;
+  tr.ok = mean > MIN_RADIUS * 2 && dev / Math.max(mean, 1e-4) < ROUNDNESS;
+  if (!tr.ok) { tr.progress = 0; return; }
+
+  let swept = 0;
+  for (let i = 1; i < tr.pts.length; i++) {
+    const a0 = Math.atan2(tr.pts[i - 1].y - cy, tr.pts[i - 1].x - cx);
+    const a1 = Math.atan2(tr.pts[i].y - cy, tr.pts[i].x - cx);
+    let d = a1 - a0;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    swept += d;
+  }
+  const prev = tr.progress;
+  tr.progress = clamp(Math.abs(swept) / (Math.PI * 2), 0, 1);
+  if (Math.floor(tr.progress * 12) > Math.floor(prev * 12)) sfx.tick();
+}
+
+function openPortal(centre, radius) {
+  portal.openAt(centre, radius);
+  for (let i = 0; i < 420; i++) {
+    const a = rnd(0, Math.PI * 2);
+    const p = centre.clone().add(new THREE.Vector3(Math.cos(a) * radius, Math.sin(a) * radius, 0));
+    spark(p, new THREE.Vector3(Math.cos(a) * rnd(1, 6), Math.sin(a) * rnd(1, 6), rnd(-2, 2)),
+      { life: rnd(0.4, 1.2), size: rnd(3, 9), grav: -1.2 });
+  }
+  flash = 0.5; flashCol.setRGB(1, 0.72, 0.36); ca = 0.35;
+  trace = null;
+  sfx.snap();
+}
+
+// ================================================================
+// MODE 2 — THE EYE
+// ================================================================
+const eye = new EyeOfAgamotto({ radius: 0.32, env: envMap });
+eye.group.visible = false;
+scene.add(eye.group);
+
+const handCircle = new MagicCircle({ radius: 1, seed: 21, color: 0x5dffa8 });
+handCircle.group.visible = false;
+scene.add(handCircle.group);
+
+const timeObjects = buildTimeObjects();
+const objectsGroup = new THREE.Group();
+objectsGroup.visible = false;
+scene.add(objectsGroup);
+timeObjects.forEach((o, i) => {
+  const n = timeObjects.length;
+  o.group.position.set((i - (n - 1) / 2) * 2.1, -0.6, 1.1);
+  o.group.scale.setScalar(0.62);
+  o.time = 0;
+  o.smoothT = 0;
+  objectsGroup.add(o.group);
+});
+
+let selected = -1;
+const selectGate = new Gate({ enter: 0.6, exit: 0.35, hold: 0.12, release: 0.35 });
+let spinAccum = 0, spinPrevAngle = null, spinCooldown = 0;
+let scrubT = 0, scrubDir = 0, scrubActive = 0, lastScrubSound = 0;
+
+/** Two hands describing a shared circular motion — the gesture that works the Eye. */
+function updateSpinGesture(hands, dt, time) {
+  spinCooldown = Math.max(0, spinCooldown - dt);
+  if (hands.length < 2) { spinPrevAngle = null; spinAccum *= Math.pow(0.2, dt); return; }
+
+  const a = tracker.toNDC(palmCenter(hands[0].lm));
+  const b = tracker.toNDC(palmCenter(hands[1].lm));
+  const angle = Math.atan2(b.y - a.y, b.x - a.x);
+
+  if (spinPrevAngle !== null) {
+    let d = angle - spinPrevAngle;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    // only count deliberate motion, and only in one consistent direction
+    if (Math.abs(d) > 0.004 && Math.abs(d) < 0.6) {
+      if (spinAccum !== 0 && Math.sign(d) !== Math.sign(spinAccum)) spinAccum *= 0.5;
+      spinAccum += d;
+    }
+    spinAccum *= Math.pow(0.55, dt);       // bleeds away if the motion stops
+  }
+  spinPrevAngle = angle;
+
+  if (Math.abs(spinAccum) > SPIN_SWEEP && spinCooldown === 0) {
+    eye.toggle();
+    spinAccum = 0;
+    spinCooldown = 1.2;
+    eye.isOpen ? sfx.eyeOpen() : sfx.eyeClose();
+    if (!eye.isOpen) { selected = -1; }
+    flash = 0.3; flashCol.setRGB(0.4, 1, 0.65); ca = 0.2;
+    const p = eye.group.position.clone();
+    for (let i = 0; i < 220; i++) {
+      const ang = rnd(0, Math.PI * 2);
+      spark(p, new THREE.Vector3(Math.cos(ang) * rnd(0.5, 3), Math.sin(ang) * rnd(0.5, 3), rnd(-1, 1)),
+        { life: rnd(0.4, 1.0), size: rnd(2, 6), grav: -0.4,
+          col: new THREE.Color(0.25, 1.0, 0.55) });
+    }
+  }
+}
+
+function updateEyeMode(hands, dt, time, body) {
+  objectsGroup.visible = true;
+
+  // --- the Eye rides the chest
+  if (body && body.visible > 0.4) {
+    const c = tracker.toNDC(body.chest);
+    const target = worldAt(c.x, c.y, 0.4);
+    eye.group.visible = true;
+    eye.group.position.lerp(target, 1 - Math.pow(0.002, dt));
+    const scale = clamp(body.width * worldHeight(0.4) * 1.15, 0.35, 3.2);
+    eye.group.scale.setScalar(scale);
+    // mirror flips the apparent roll direction
+    eye.group.rotation.z = (tracker.state.mirror ? 1 : -1) * body.roll;
+  } else {
+    // no body yet: park it centre-low so the mode is still usable
+    eye.group.visible = true;
+    eye.group.position.lerp(worldAt(0, -0.15, 0.4), 1 - Math.pow(0.02, dt));
+    eye.group.scale.setScalar(0.9);
+  }
+
+  updateSpinGesture(hands, dt, time);
+  eye.update(dt, time);
+
+  // --- green circle around the working hand while the Eye is open
+  const working = hands.find(h => spread(h.lm) > 1.2) || hands[0];
+  if (eye.open > 0.05 && working) {
+    const p = tracker.toNDC(palmCenter(working.lm));
+    const w = worldAt(p.x, p.y, 0.6);
+    handCircle.group.visible = true;
+    handCircle.group.position.lerp(w, 1 - Math.pow(0.004, dt));
+    handCircle.group.scale.setScalar(
+      clamp(handScale(working.lm) * worldHeight(0.6) * 2.4, 0.3, 2.4));
+    handCircle.update(time, 1, eye.open * 0.9, 1);
+  } else {
+    handCircle.group.visible = false;
+  }
+
+  // --- pointing selects an object
+  let pointer = null;
+  for (const h of hands) {
+    const c = pointConfidence(h.lm, h.o);
+    if (c > 0.5) { pointer = h; break; }
+  }
+
+  if (eye.open > 0.5 && pointer) {
+    const tip = tracker.toNDC(pointer.lm[8]);
+    let best = -1, bestD = 1e9;
+    timeObjects.forEach((o, i) => {
+      const sp = o.group.position.clone().project(camera);
+      const d = Math.hypot(sp.x - tip.x, sp.y - tip.y);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    const near = selectGate.update(conf(0.42 - bestD, 0, 0.18), dt);
+    if (near && best !== selected) { selected = best; sfx.select(); }
+  }
+
+  // --- palm tilt scrubs the selected object's timeline, absolutely
+  scrubActive = 0;
+  if (eye.open > 0.5 && selected >= 0) {
+    const scrubber = hands.find(h => spread(h.lm) > 1.35);
+    if (scrubber) {
+      // facing runs -1 (back of hand) → +1 (palm square on); map that span
+      // straight onto the timeline so every angle is one exact frame
+      const raw = clamp((scrubber.o.facing + 0.55) / 1.35, 0, 1);
+      const obj = timeObjects[selected];
+      const prev = obj.smoothT;
+      obj.smoothT += (raw - obj.smoothT) * (1 - Math.pow(0.0009, dt));
+      obj.setTime(obj.smoothT);
+      scrubDir = Math.sign(obj.smoothT - prev);
+      scrubActive = clamp(Math.abs(obj.smoothT - prev) / Math.max(dt, 1e-3) * 1.6, 0, 1);
+
+      // temporal particles: they stream backwards when time runs backwards
+      if (scrubActive > 0.05) {
+        const p = obj.group.position;
+        for (let i = 0; i < Math.round(scrubActive * 6); i++) {
+          const a = rnd(0, Math.PI * 2), r = rnd(0.4, 1.2);
+          const at = p.clone().add(new THREE.Vector3(Math.cos(a) * r, rnd(-0.6, 0.9), Math.sin(a) * r));
+          const v = new THREE.Vector3(-Math.cos(a), 0.1, -Math.sin(a))
+            .multiplyScalar(scrubDir < 0 ? 1.6 : -1.6);
+          spark(at, v, { life: rnd(0.4, 0.9), size: rnd(2, 5), grav: 0,
+            col: new THREE.Color(0.25, 1.0, 0.5) });
+        }
+        if (time - lastScrubSound > 0.14) { sfx.scrub(scrubDir); lastScrubSound = time; }
+      }
+    }
+  }
+
+  timeObjects.forEach((o, i) => {
+    o.setSelected(i === selected && eye.open > 0.5 ? 1 : 0);
+    o.update(dt, time);
+  });
+}
+
+// ================================================================
+// FRAME
+// ================================================================
+function setMode(m) {
+  mode = m;
+  document.getElementById('tab-portal').classList.toggle('on', m === 'portal');
+  document.getElementById('tab-eye').classList.toggle('on', m === 'eye');
+  statusEl.classList.toggle('green', m === 'eye');
+  hudEl.classList.toggle('eye', m === 'eye');
+  hudEl.innerHTML = m === 'portal'
+    ? `<b>Hold two fingers up</b> on one hand &nbsp;·&nbsp;
+       <b>trace a circle</b> with the other &nbsp;·&nbsp; <b>fist</b> to close<br>
+       <b>1 / 2</b> switch mode &nbsp;·&nbsp; <b>F</b> fullscreen &nbsp;·&nbsp;
+       <b>H</b> hide &nbsp;·&nbsp; <b>C</b> camera &nbsp;·&nbsp; <b>D</b> debug &nbsp;·&nbsp;
+       <b>M</b> mute &nbsp;·&nbsp; <b>Space</b> test`
+    : `<b>Circle both hands</b> to open and close the Eye &nbsp;·&nbsp;
+       <b>point</b> to select an object &nbsp;·&nbsp; <b>tilt your palm</b> to scrub time<br>
+       <b>1 / 2</b> switch mode &nbsp;·&nbsp; <b>F</b> fullscreen &nbsp;·&nbsp;
+       <b>H</b> hide &nbsp;·&nbsp; <b>C</b> camera &nbsp;·&nbsp; <b>D</b> debug &nbsp;·&nbsp;
+       <b>M</b> mute &nbsp;·&nbsp; <b>Space</b> test`;
+
+  // park whatever the other mode owns
+  portal.group.visible = mode === 'portal' && portal.state !== 'closed';
+  portalRing.group.visible = false;
+  traceCircle.group.visible = false;
+  eye.group.visible = mode === 'eye';
+  handCircle.group.visible = false;
+  objectsGroup.visible = mode === 'eye';
+}
+
+function frame(hands, dt, time, extra) {
+  const body = extra?.body || null;
+
+  if (mode === 'portal') updatePortalMode(hands, dt, time);
+  else updateEyeMode(hands, dt, time, body);
+
+  updateSparks(dt);
+  sparkMat.uniforms.uTime.value = time;
+
+  // --- camera feed + light spill
+  const video = tracker?.video;
+  if (showCam && video && video.readyState >= 2) {
+    if (!bgMat.uniforms.uTex.value) {
+      const tex = new THREE.VideoTexture(video);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      bgMat.uniforms.uTex.value = tex;
+    }
+    bgMat.uniforms.uHas.value = 1;
+    bgMat.uniforms.uVideoAspect.value = video.videoWidth / video.videoHeight;
+    bgMat.uniforms.uMirror.value = tracker.state.mirror ? 1 : 0;
+  } else bgMat.uniforms.uHas.value = 0;
+
+  const warmSrc = portal.isOpen ? portal.group.position : null;
+  if (warmSrc) {
+    const s = warmSrc.clone().project(camera);
+    bgMat.uniforms.uWarmPos.value.set(s.x * 0.5 + 0.5, s.y * 0.5 + 0.5);
+  }
+  bgMat.uniforms.uWarm.value = lerp(bgMat.uniforms.uWarm.value,
+    portal.isOpen ? portal.open * 1.15 : 0, 1 - Math.pow(0.01, dt));
+
+  if (mode === 'eye') {
+    const s = eye.group.position.clone().project(camera);
+    bgMat.uniforms.uGreenPos.value.set(s.x * 0.5 + 0.5, s.y * 0.5 + 0.5);
+  }
+  bgMat.uniforms.uGreen.value = lerp(bgMat.uniforms.uGreen.value,
+    mode === 'eye' ? eye.open * 0.9 : 0, 1 - Math.pow(0.01, dt));
+
+  // --- post uniforms
+  finalPass.uniforms.uTime.value = time;
+  finalPass.uniforms.uCA.value = ca;
+  finalPass.uniforms.uFlash.value = flash;
+  finalPass.uniforms.uFlashCol.value.copy(flashCol);
+  finalPass.uniforms.uWarp.value = scrubActive * 0.9;
+  if (selected >= 0) {
+    const s = timeObjects[selected].group.position.clone().project(camera);
+    finalPass.uniforms.uWarpPos.value.set(s.x * 0.5 + 0.5, s.y * 0.5 + 0.5);
+  }
+  flash *= Math.pow(0.002, dt);
+  ca *= Math.pow(0.01, dt);
+
+  if (A.on) {
+    A.humGain.gain.setTargetAtTime(
+      A.muted ? 0 : (portal.isOpen ? 0.055 * portal.open : 0), A.ctx.currentTime, 0.2);
+  }
+
+  composer.render();
+  drawOverlay(hands);
+
+  statusEl.textContent = mode === 'portal'
+    ? (portal.isOpen ? 'portal open — fist to close'
+      : trace?.ok && trace.progress > 0.03 ? `tracing ${Math.round(trace.progress * 100)}%`
+      : hands.length >= 2 ? 'two fingers up, then draw'
+      : hands.length ? 'show your other hand' : 'no hands detected')
+    : (eye.open > 0.5
+      ? (selected >= 0
+        ? `${timeObjects[selected].label} · ${Math.round(timeObjects[selected].smoothT * 100)}%`
+        : 'point at an object')
+      : hands.length >= 2 ? 'circle both hands to open the eye'
+      : 'show both hands');
+}
+
+function drawOverlay(hands) {
+  uictx.setTransform(1, 0, 0, 1, 0, 0);
+  uictx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+  if (!showDebug) return;
+  drawHandDebug(uictx, {
+    hands, toScreen: (p, w, h) => ({
+      x: (tracker.state.mirror ? 1 - p.x : p.x) * w, y: p.y * h,
+    }),
+    W: uiCanvas.width, H: uiCanvas.height, dpr,
+    checks: h => mode === 'portal' ? [
+      { label: 'two fingers up', pass: (h._two ?? 0) > 0.5, value: (h._two ?? 0).toFixed(2) },
+      { label: 'pointing',       pass: (h._point ?? 0) > 0.5, value: (h._point ?? 0).toFixed(2) },
+      { label: 'circle round',   pass: !!trace?.ok,
+        value: trace ? `${Math.round(trace.progress * 100)}%` : '—' },
+      { label: 'portal open',    pass: portal.isOpen, value: portal.state },
+    ] : [
+      { label: 'eye open',   pass: eye.open > 0.5, value: eye.open.toFixed(2) },
+      { label: 'spin sweep', pass: Math.abs(spinAccum) > SPIN_SWEEP,
+        value: `${spinAccum.toFixed(2)}/${SPIN_SWEEP}` },
+      { label: 'selected',   pass: selected >= 0,
+        value: selected >= 0 ? timeObjects[selected].label : 'none' },
+      { label: 'scrub tilt', pass: Math.abs(h.o.facing) > 0.1, value: h.o.facing.toFixed(2) },
+    ],
+  });
+}
+
+// ================================================================
+// INPUT + BOOT
+// ================================================================
+addEventListener('keydown', e => {
+  initAudio();
+  const k = e.key.toLowerCase();
+  if (k === '1') setMode('portal');
+  else if (k === '2') setMode('eye');
+  else if (k === 'f') {
+    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  } else if (k === 'h') hudEl.classList.toggle('hidden');
+  else if (k === 'c') showCam = !showCam;
+  else if (k === 'd') showDebug = !showDebug;
+  else if (k === 'm') { A.muted = !A.muted; if (A.master) A.master.gain.value = A.muted ? 0 : 0.85; }
+  else if (k === ' ') {
+    e.preventDefault();
+    if (mode === 'portal') {
+      if (portal.isOpen) { portal.close(); portalRing.group.visible = false; sfx.close(); }
+      else openPortal(worldAt(0, 0, 0), worldHeight(0) * 0.22);
+    } else {
+      eye.toggle();
+      eye.isOpen ? sfx.eyeOpen() : sfx.eyeClose();
+      if (selected < 0) selected = 0;
+    }
+  }
+});
+addEventListener('pointerdown', initAudio);
+soundBtn.addEventListener('click', initAudio);
+
+setMode('portal');
+
+tracker = await createTracker({
+  numHands: 2, pose: true, bootText: 'Opening the sanctum…',
+});
+tracker.onFrame(frame);
+</script>
+</body>
+</html>

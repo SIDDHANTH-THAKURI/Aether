@@ -33,10 +33,42 @@ export const projects = [
     status: "live",
     needs: "Camera",
     description:
-      "Cup both palms together to charge an energy orb, then thrust to fire. Charge time " +
-      "sets the beam's size and length, and the release direction is read from how your " +
-      "hands were travelling at the moment you let go.",
-    tags: ["Hand tracking", "Canvas", "Gesture chain"],
+      "Cup both palms and a core forms, pulsing, dragging ambient energy in from the " +
+      "room and lighting everything it touches. Thrust forward and it releases as a " +
+      "sustained beam with a white-hot core, crackling tendrils and a shockwave.",
+    tags: ["Hand tracking", "WebGL2", "Shaders", "WebAudio"],
+  },
+  {
+    id: "sanctum",
+    title: "Sanctum",
+    subtitle: "Portals · Eye of Agamotto",
+    glyph: "⟁",
+    accent: "#ffb347",
+    href: "strange.html",
+    status: "live",
+    needs: "Camera · WebGL2",
+    description:
+      "Two modes. Hold two fingers up and trace a circle to build a portal that " +
+      "snaps open onto a real tunnel with a view beyond. Or wear the Eye of Agamotto: " +
+      "circle both hands to fold its leaves open, point at an object, and tilt your " +
+      "palm to scrub its timeline — the apple un-bites itself as you turn back.",
+    tags: ["Hand tracking", "Body tracking", "Three.js", "Shaders", "WebAudio"],
+  },
+  {
+    id: "mark-vii",
+    title: "Mark VII",
+    subtitle: "Suit up · Repulsors",
+    glyph: "◎",
+    accent: "#5fd0ff",
+    href: "ironman.html",
+    status: "live",
+    needs: "Camera · WebGL2",
+    description:
+      "Stand back and put your arms out: armour flies in from off screen piece by " +
+      "piece — boots, shins, thighs, chest, shoulders, arms, gauntlets, helmet — and " +
+      "locks to your body, tracking as you move. The eyes light, a JARVIS HUD boots " +
+      "up, and raising a palm spins the repulsor until you push it forward.",
+    tags: ["Hand tracking", "Body tracking", "Three.js", "HUD", "WebAudio"],
   },
   {
     id: "particle-field",

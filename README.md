@@ -11,7 +11,24 @@ hand gestures drive real-time WebGL effects — built to be projected.
 | `projects.html` | Gallery, generated from `projects.js` |
 | `phoenix.html` | Snap → cup → throw fireballs (two-handed) |
 | `kame.html` | Charge and release an energy beam |
+| `strange.html` | Portals, and the Eye of Agamotto with scrubable time |
+| `ironman.html` | Suit-up sequence, JARVIS HUD and repulsors |
 | `show.html` | Ambient morphing particle field, no input needed |
+
+### Shared modules
+
+| Module | What it does |
+| --- | --- |
+| `handtrack.js` | Camera picking, One Euro filtering, hand/pose/face landmarks, 3D palm orientation, gesture gates, debug overlay |
+| `site.js` | Landing + gallery shell: background shader, cursor embers, reveals |
+| `strange/magic.js` | Procedural rune glyphs, magic circles, additive shaders |
+| `strange/portal.js` | Portal rim, tunnel and the vista beyond |
+| `strange/eye.js` | The Eye of Agamotto: housing, hinged leaves, Time Stone, chain |
+| `strange/timeobjects.js` | Objects whose whole appearance is a function of t |
+| `ironman/armor.js` | Procedural armour plates and the body-attachment manifest |
+
+All 3D assets are **generated at runtime** from primitives and shaders. There
+are no model or texture files to download.
 
 ## Running locally
 
