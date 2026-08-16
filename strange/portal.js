@@ -43,7 +43,10 @@ const RIM_FRAG = /* glsl */`
     // sparks racing around the circumference
     float spark = pow(max(0.0, sin(around*180.0 - uTime*9.0) * flame), 9.0) * 2.2;
 
-    float a = clamp(body + core + spark, 0.0, 2.0) * uAlpha * uOpen;
+    // None of these layers are tone mapped, so anything much over 1 simply
+    // clips to white and then feeds the bloom — keep the ceiling low enough
+    // that the flame detail survives.
+    float a = clamp(body + core + spark, 0.0, 1.25) * uAlpha * uOpen;
     vec3 col = mix(uColorCool, uColorHot, clamp(core + spark*0.6 + flame*0.35, 0.0, 1.0));
     if(a <= 0.004) discard;
     gl_FragColor = vec4(col * a, a);
@@ -65,10 +68,10 @@ const TUNNEL_FRAG = /* glsl */`
 
     // the wall glows near the mouth and falls into darkness further in
     float falloff = pow(1.0 - depth, 2.2);
-    float glow = falloff * (0.30 + streak*0.85) + bands*falloff*0.9;
+    float glow = falloff * (0.22 + streak*0.60) + bands*falloff*0.55;
 
     vec3 col = mix(vec3(0.35,0.09,0.01), vec3(1.0,0.62,0.18), glow);
-    col += vec3(1.0,0.85,0.55) * bands * falloff * 0.7;
+    col += vec3(1.0,0.85,0.55) * bands * falloff * 0.45;
 
     float a = clamp(glow, 0.0, 1.0) * uAlpha * uOpen;
     if(a <= 0.004) discard;
@@ -114,8 +117,8 @@ const VISTA_FRAG = /* glsl */`
     // low sun
     vec2 sunP = vec2(0.5 + sin(uSeed)*0.18, 0.30);
     float d = length((uv - sunP) * vec2(1.6, 1.0));
-    sky += vec3(1.0,0.78,0.42) * exp(-d*7.0) * 1.5;
-    sky += vec3(1.0,0.55,0.20) * exp(-d*2.2) * 0.35;
+    sky += vec3(1.0,0.78,0.42) * exp(-d*7.0) * 0.80;
+    sky += vec3(1.0,0.55,0.20) * exp(-d*2.2) * 0.16;
 
     // distant skyline along the bottom
     float sl = skyline(uv*vec2(2.0,1.0));
@@ -126,9 +129,18 @@ const VISTA_FRAG = /* glsl */`
     float win = step(0.93, hash21(floor(uv*vec2(90.0,60.0)) + uSeed));
     sky += vec3(1.0,0.72,0.35) * win * mask * 0.55;
 
+    // The vista is a large opaque area sitting under an additive rim and
+    // tunnel. Held near 1 it reads as a place you could step into; any hotter
+    // and the three layers sum straight to white.
+    sky *= 0.72;
+
     gl_FragColor = vec4(sky * uOpen, 1.0);
   }`;
 
+// The constant here sets how many pixels a unit of aSize covers at one world
+// unit of distance. At 300 a single ember drew up to 400px across — wider than
+// the portal it was orbiting — and 420 of them overlapping additively turned
+// the whole opening into a flat white disc.
 const SPARK_VERT = /* glsl */`
   attribute float aSize;
   attribute float aSeed;
@@ -136,7 +148,7 @@ const SPARK_VERT = /* glsl */`
   void main(){
     vSeed = aSeed;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
-    gl_PointSize = aSize * (300.0 / max(-mv.z, 0.001));
+    gl_PointSize = aSize * (34.0 / max(-mv.z, 0.001));
     gl_Position = projectionMatrix * mv;
   }`;
 
@@ -158,6 +170,10 @@ const SPARK_FRAG = /* glsl */`
 export class Portal {
   constructor({ radius = 1, depth = 2.4, seed = Math.random() * 10 } = {}) {
     this.group = new THREE.Group();
+    // baseRadius is what the geometry was actually built at; radius is what it
+    // is currently scaled to. Keeping both is what stops repeated openAt() calls
+    // from compounding their scale factors against a moving reference.
+    this.baseRadius = radius;
     this.radius = radius;
     this.depth = depth;
     this.open = 0;          // 0..1 iris
@@ -227,7 +243,7 @@ export class Portal {
         drift: (Math.random() - 0.5) * radius * 0.25,
         life: Math.random(),
       });
-      size[i] = 2 + Math.random() * 6;
+      size[i] = 1.5 + Math.random() * 3.5;
       seeds[i] = Math.random();
     }
     const sg = new THREE.BufferGeometry();
@@ -250,7 +266,7 @@ export class Portal {
   }
 
   openAt(position, radius) {
-    if (radius && radius !== this.radius) this.setRadius(radius);
+    if (radius) this.setRadius(radius);
     this.group.position.copy(position);
     this.group.visible = true;
     this.state = 'opening';
@@ -258,18 +274,18 @@ export class Portal {
   }
 
   setRadius(radius) {
-    const k = radius / this.radius;
     this.radius = radius;
-    this.group.scale.setScalar(1);
-    this.rim.scale.setScalar(k);
-    this.rimOuter.scale.setScalar(k);
-    this.tunnel.scale.setScalar(k);
-    this.vista.scale.setScalar(k);
-    this.sparks.scale.setScalar(k);
-    this._k = k;
+    this._k = radius / this.baseRadius;
   }
 
   close() { if (this.state !== 'closed') this.state = 'closing'; }
+
+  /** Snap shut with no animation — for tearing down when the mode changes. */
+  forceClose() {
+    this.state = 'closed';
+    this.open = 0;
+    this.group.visible = false;
+  }
 
   get isOpen() { return this.state === 'open' || this.state === 'opening'; }
 
@@ -306,17 +322,20 @@ export class Portal {
     this.sparkMat.uniforms.uTime.value = time;
     this.sparkMat.uniforms.uAlpha.value = e;
 
-    // sparks ride the rim, occasionally flying off and respawning
+    // Sparks ride the rim, occasionally flying off and respawning. Their radii
+    // stay in base units because the Points object is already scaled by k —
+    // measuring them against the live radius scaled them twice.
     const arr = this.sparks.geometry.attributes.position.array;
+    const R0 = this.baseRadius;
     this.sparkState.forEach((s, i) => {
       s.a += s.speed * dt * 1.3;
       s.life += dt * 0.6;
-      if (s.life > 1) { s.life = 0; s.r = this.radius * (0.96 + Math.random() * 0.12); }
-      const fly = s.life * s.life * this.radius * 0.5;
+      if (s.life > 1) { s.life = 0; s.r = R0 * (0.96 + Math.random() * 0.12); }
+      const fly = s.life * s.life * R0 * 0.5;
       const r = s.r + fly;
       arr[i * 3] = Math.cos(s.a) * r;
       arr[i * 3 + 1] = Math.sin(s.a) * r;
-      arr[i * 3 + 2] = s.drift + Math.sin(s.a * 3 + time) * this.radius * 0.05;
+      arr[i * 3 + 2] = s.drift + Math.sin(s.a * 3 + time) * R0 * 0.05;
     });
     this.sparks.geometry.attributes.position.needsUpdate = true;
 

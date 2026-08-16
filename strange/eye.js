@@ -42,8 +42,11 @@ function housingGeometry(r) {
 /**
  * One iris leaf: a sector plate whose hinge sits on the outer rim, so
  * rotating it about that hinge folds it back the way the film's do.
+ *
+ * The span has to clear a quarter turn for four leaves to actually meet —
+ * anything narrower leaves the stone showing through the gaps when shut.
  */
-function leafGeometry(r, spanDeg = 46) {
+function leafGeometry(r, spanDeg = 96) {
   const span = THREE.MathUtils.degToRad(spanDeg);
   const shape = new THREE.Shape();
   shape.moveTo(0, 0);
@@ -122,17 +125,27 @@ export class EyeOfAgamotto {
     this.amulet.add(band);
 
     // --- four hinged leaves
+    //
+    // Two nested objects per leaf on purpose. The outer one carries the leaf
+    // out to its hinge point on the rim; the inner one does the folding, so
+    // the fold happens about the leaf's own tangent. Putting both rotations on
+    // one object folds every leaf about the parent's Y axis instead, which
+    // makes the ones at the sides twist in place rather than open.
     this.leaves = [];
     const leafGeo = leafGeometry(R * 0.92);
     for (let i = 0; i < 4; i++) {
       const theta = (i / 4) * Math.PI * 2 + Math.PI / 4;
       const pivot = new THREE.Object3D();
       pivot.rotation.z = theta;
-      pivot.position.set(Math.cos(theta) * R * 0.92, Math.sin(theta) * R * 0.92, R * 0.03);
-      const mesh = new THREE.Mesh(leafGeo, goldMaterial(env, { rough: 0.22 }));
-      pivot.add(mesh);
+      // Sit the leaves just proud of the bezel (the housing face tops out at
+      // 0.17R) with a small stagger so overlapping leaves do not z-fight.
+      pivot.position.set(Math.cos(theta) * R * 0.92, Math.sin(theta) * R * 0.92,
+        R * (0.20 + i * 0.012));
+      const fold = new THREE.Object3D();
+      fold.add(new THREE.Mesh(leafGeo, goldMaterial(env, { rough: 0.22 })));
+      pivot.add(fold);
       this.amulet.add(pivot);
-      this.leaves.push(pivot);
+      this.leaves.push(fold);
     }
 
     // --- the stone, behind the leaves
@@ -143,8 +156,12 @@ export class EyeOfAgamotto {
       },
       vertexShader: STONE_VERT, fragmentShader: STONE_FRAG,
     });
-    this.stone = new THREE.Mesh(new THREE.IcosahedronGeometry(R * 0.40, 2), this.stoneMat);
-    this.stone.position.z = -R * 0.02;
+    // Flattened and set back into the housing. A full sphere of this radius
+    // stood proud of the bezel, so it showed straight through the shut leaves
+    // and the Eye never looked closed.
+    this.stone = new THREE.Mesh(new THREE.IcosahedronGeometry(R * 0.34, 2), this.stoneMat);
+    this.stone.scale.set(1, 1, 0.45);
+    this.stone.position.z = -R * 0.04;
     this.amulet.add(this.stone);
 
     // glow shell that blooms once the leaves part
@@ -175,14 +192,19 @@ export class EyeOfAgamotto {
       new THREE.Vector3(R * 2.6, R * 3.5, -R * 0.7),
     ]);
 
-    const perSide = 26;
-    const link = new THREE.TorusGeometry(R * 0.11, R * 0.035, 8, 18);
+    // Spaced so consecutive links just overlap. Packed much tighter than this
+    // the ring shapes stop being readable and the whole thing looks like a
+    // coil spring rather than a chain.
+    const perSide = 16;
+    const link = new THREE.TorusGeometry(R * 0.11, R * 0.032, 8, 18);
     const mesh = new THREE.InstancedMesh(link, goldMaterial(env, { rough: 0.34 }),
       perSide * 2);
 
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();
     const up = new THREE.Vector3(0, 0, 1);
+    const flip = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+    const one = new THREE.Vector3(1, 1, 1);
     let n = 0;
     for (const curve of [curveL, curveR]) {
       for (let i = 0; i < perSide; i++) {
@@ -190,9 +212,11 @@ export class EyeOfAgamotto {
         const p = curve.getPointAt(t);
         const tan = curve.getTangentAt(t);
         q.setFromUnitVectors(up, tan);
-        // every other link turns 90° so the chain reads as interlocking
-        if (i % 2) q.multiply(new THREE.Quaternion().setFromAxisAngle(up, Math.PI / 2));
-        m.compose(p, q, new THREE.Vector3(1, 1, 1));
+        // Every other link turns 90° so the chain reads as interlocking. This
+        // has to be about an axis across the link — turning it about `up`
+        // spins a torus around its own axis of symmetry and changes nothing.
+        if (i % 2) q.multiply(flip);
+        m.compose(p, q, one);
         mesh.setMatrixAt(n++, m);
       }
     }
@@ -210,10 +234,10 @@ export class EyeOfAgamotto {
     this.open += (this.target - this.open) * (1 - Math.pow(0.005, dt));
 
     const e = this.open * this.open * (3 - 2 * this.open);
-    this.leaves.forEach((pivot, i) => {
+    this.leaves.forEach((fold, i) => {
       // a small stagger so they do not move as one rigid piece
       const stagger = THREE.MathUtils.clamp(e * 1.25 - i * 0.06, 0, 1);
-      pivot.rotation.y = -stagger * THREE.MathUtils.degToRad(118);
+      fold.rotation.y = -stagger * THREE.MathUtils.degToRad(118);
     });
 
     this.stoneMat.uniforms.uTime.value = time;

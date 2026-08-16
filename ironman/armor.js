@@ -109,10 +109,12 @@ function buildHelmet(M) {
   jaw.rotation.x = 0.35;
   g.add(jaw);
 
-  // eye slits
+  // eye slits — dark until the boot sequence brings them up
+  const eyeMat = M.glow.clone();
+  eyeMat.opacity = 0;
   const eyes = new THREE.Group();
   for (const s of [-1, 1]) {
-    const eye = new THREE.Mesh(plate(0.17, 0.055, 0.03, 0.02), M.glow);
+    const eye = new THREE.Mesh(plate(0.17, 0.055, 0.03, 0.02), eyeMat);
     eye.position.set(s * 0.155, 0.045, 0.485);
     eye.rotation.z = -s * 0.16;
     eye.rotation.y = -s * 0.22;
@@ -120,6 +122,7 @@ function buildHelmet(M) {
   }
   g.add(eyes);
   g.userData.eyes = eyes;
+  g.userData.eyeMat = eyeMat;
 
   // side vents
   for (const s of [-1, 1]) {
@@ -280,14 +283,19 @@ export function buildSuit(env) {
     { id: 'thighR',    build: () => buildLimb(M, { rTop: 0.25, rBot: 0.20, len: 0.9 }),
       from: POSE.rightHip,   to: POSE.rightKnee,  at: 0.5, scale: 1.0, align: true, nominal: 0.9 },
 
+    // The `align: true` pieces below size themselves to their bone exactly.
+    // These three do not, so their multipliers have to account for how wide the
+    // built geometry already is in local units — chest is 1.34 across, a
+    // shoulder cap 0.75, the helmet 1.0. Treating those as 1.0 made every one
+    // of them render around half again too big.
     { id: 'chest',     build: () => buildChest(M),
-      from: POSE.leftShoulder, to: POSE.rightShoulder, at: 0.5, scale: 1.15,
+      from: POSE.leftShoulder, to: POSE.rightShoulder, at: 0.5, scale: 0.78,
       drop: 0.34, torso: true },
 
     { id: 'shoulderL', build: () => buildShoulder(M, -1),
-      from: POSE.leftShoulder, to: POSE.leftElbow, at: 0.05, scale: 0.95 },
+      from: POSE.leftShoulder, to: POSE.leftElbow, at: 0.05, scale: 0.60 },
     { id: 'shoulderR', build: () => buildShoulder(M, 1),
-      from: POSE.rightShoulder, to: POSE.rightElbow, at: 0.05, scale: 0.95 },
+      from: POSE.rightShoulder, to: POSE.rightElbow, at: 0.05, scale: 0.60 },
 
     { id: 'armL',      build: () => buildLimb(M, { rTop: 0.20, rBot: 0.17, len: 0.85 }),
       from: POSE.leftShoulder, to: POSE.leftElbow, at: 0.5, scale: 1.0, align: true, nominal: 0.85 },
@@ -300,7 +308,7 @@ export function buildSuit(env) {
       from: POSE.rightElbow, to: POSE.rightWrist, at: 0.55, scale: 1.0, align: true, nominal: 0.46 },
 
     { id: 'helmet',    build: () => buildHelmet(M),
-      from: POSE.leftEar,    to: POSE.rightEar,   at: 0.5, scale: 2.1, head: true },
+      from: POSE.leftEar,    to: POSE.rightEar,   at: 0.5, scale: 1.35, head: true },
   ];
 
   const pieces = def.map((d, i) => {
@@ -308,7 +316,8 @@ export function buildSuit(env) {
     const holder = new THREE.Group();     // holds the piece; sequence animates this
     holder.add(obj);
     holder.visible = false;
-    return { ...d, index: i, object: obj, holder, seated: false, t: 0 };
+    return { ...d, index: i, object: obj, holder, seated: false, t: 0,
+             origin: null, startAt: null, lost: 0 };
   });
 
   return { materials: M, pieces };

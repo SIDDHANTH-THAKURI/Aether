@@ -68,7 +68,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
-import { createTracker, palmCenter, handScale, spread, isFist, isOpenPalm,
+import { createTracker, palmCenter, handScale, spread, isFist,
          Gate, conf, drawHandDebug, POSE } from './handtrack.js';
 import { buildSuit } from './ironman/armor.js';
 
@@ -77,6 +77,8 @@ import { buildSuit } from './ironman/armor.js';
 // ================================================================
 const PIECE_STAGGER = 0.26;   // seconds between pieces launching
 const PIECE_FLIGHT  = 0.78;   // seconds each piece spends in the air
+const SKIP_AFTER    = 1.6;    // seconds a piece waits for landmarks before it stops blocking
+const CORE_PIECES   = new Set(['chest', 'helmet']);   // these must arrive; the rest are optional
 const CHARGE_TIME   = 1.15;   // seconds from raised palm to full charge
 const MIN_FIRE      = 0.25;   // charge needed before a push will fire
 const PUSH_FIRE     = 1.25;   // hand-growth rate that counts as a thrust
@@ -283,7 +285,9 @@ const pMat = new THREE.ShaderMaterial({
     void main(){
       vSeed = aSeed;
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      gl_PointSize = aSize * (320.0 / max(-mv.z, 0.001));
+      // pixels per unit of aSize at one world unit away; at 320 a single mote
+      // covered a third of the screen and a burst of them washed out to white
+      gl_PointSize = aSize * (34.0 / max(-mv.z, 0.001));
       gl_Position = projectionMatrix * mv;
     }`,
   fragmentShader: `
@@ -386,26 +390,32 @@ function targetFor(def, pose) {
   return { pos, rot, scale: Math.max(scale, 1e-3), len };
 }
 
+function clearPieces() {
+  for (const p of suit.pieces) {
+    p.seated = false; p.t = 0; p.holder.visible = false;
+    p.origin = null; p.startAt = null; p.lost = 0;
+  }
+  seatedAt.clear();
+}
+
 function startSuitUp() {
   if (phase !== 'idle') return;
   phase = 'assembling';
   seqTime = 0;
-  seatedAt.clear();
+  bootTime = 0;
   // origins are recomputed against wherever the body is standing now
-  for (const p of suit.pieces) {
-    p.seated = false; p.t = 0; p.holder.visible = false; p.origin = null;
-  }
+  clearPieces();
   sfx.launch();
 }
 
 function resetSuit() {
   phase = 'idle';
   seqTime = 0;
-  for (const p of suit.pieces) {
-    p.seated = false; p.t = 0; p.holder.visible = false; p.origin = null;
-  }
-  seatedAt.clear();
+  bootTime = 0;
+  clearPieces();
   reactorLight.intensity = 0;
+  const em = helmetPiece.object.userData.eyeMat;
+  if (em) em.opacity = 0;
 }
 
 function updateSuit(pose, dt, time) {
@@ -419,11 +429,17 @@ function updateSuit(pose, dt, time) {
     const launchAt = i * PIECE_STAGGER;
 
     if (!target) {
-      // the body part is out of frame — hide rather than guess
-      if (!p.seated) allSeated = false;
+      // The body part is out of frame — hide rather than guess. Anyone sitting
+      // at a desk has no legs on camera, so a piece that keeps waiting for
+      // landmarks that are never coming has to stop holding up the sequence,
+      // or the suit stays stuck at 'assembling' forever. Chest and helmet are
+      // the exception: without those there is no suit to boot.
       p.holder.visible = false;
+      if (seqTime >= launchAt) p.lost += dt;
+      if (!p.seated && (CORE_PIECES.has(p.id) || p.lost < SKIP_AFTER)) allSeated = false;
       return;
     }
+    p.lost = 0;
 
     if (phase === 'assembling' && seqTime < launchAt) {
       p.holder.visible = false;
@@ -435,7 +451,10 @@ function updateSuit(pose, dt, time) {
 
     if (!p.seated) {
       allSeated = false;
-      p.t = clamp((seqTime - launchAt) / PIECE_FLIGHT, 0, 1);
+      // Flight is timed from when this piece first had somewhere to fly to, so
+      // a limb that walks into frame late still flies in instead of snapping on.
+      if (p.startAt === null) p.startAt = Math.max(seqTime, launchAt);
+      p.t = clamp((seqTime - p.startAt) / PIECE_FLIGHT, 0, 1);
 
       // fly in from off screen, on a curved approach
       if (!p.origin) {
@@ -447,7 +466,7 @@ function updateSuit(pose, dt, time) {
       const overshoot = Math.sin(p.t * Math.PI) * 0.35;
       p.holder.position.lerpVectors(p.origin, target.pos, e);
       p.holder.position.z += overshoot;
-      p.holder.rotation.z = lerp(rnd(-0.02, 0.02) + p.holder.rotation.z, target.rot, e);
+      p.holder.rotation.z = lerp(p.holder.rotation.z, target.rot, e);
       p.holder.rotation.x = (1 - e) * 2.4;
       p.holder.rotation.y = (1 - e) * 3.1;
       p.holder.scale.setScalar(target.scale * (0.55 + e * 0.45));
@@ -485,13 +504,17 @@ function updateSuit(pose, dt, time) {
   }
   if (phase === 'booting') {
     bootTime += dt;
-    // eyes come up as the helmet closes
-    const k = clamp(bootTime / 1.3, 0, 1);
-    if (helmetPiece.object.userData.eyes) {
-      for (const e of helmetPiece.object.userData.eyes.children)
-        e.material.opacity = k * (0.75 + 0.25 * Math.sin(time * 18));
-    }
     if (bootTime > 1.5) { phase = 'online'; sfx.online(); }
+  }
+
+  // Eyes flicker up as the helmet closes, then settle to a slow idle pulse.
+  // Driving them only during 'booting' left them frozen at whatever the last
+  // flicker happened to be.
+  const eyeMat = helmetPiece.object.userData.eyeMat;
+  if (eyeMat) {
+    eyeMat.opacity = phase === 'booting'
+      ? clamp(bootTime / 1.3, 0, 1) * (0.75 + 0.25 * Math.sin(time * 18))
+      : phase === 'online' ? 0.86 + 0.14 * Math.sin(time * 3.4) : 0;
   }
 
   // arc reactor pulse + the light it throws
@@ -581,9 +604,14 @@ function updateRepulsors(hands, pose, dt, time) {
     const w = worldAt(p.x, p.y, 0.6);
     u.pos.lerp(w, 1 - Math.pow(0.004, dt));
 
+    // Growth rate of the hand on screen — a thrust toward the camera makes it
+    // bigger fast. The camera delivers frames at half the render rate, so this
+    // reads zero on every repeated frame; holding the peak with a quick decay
+    // keeps a real thrust from landing on a frame that measured nothing.
     const scale = handScale(lm);
-    u.push = u.prevScale === null ? 0
+    const raw = u.prevScale === null ? 0
       : (scale - u.prevScale) / Math.max(dt, 1e-3) / Math.max(scale, 1e-4);
+    u.push = Math.max(raw, u.push * Math.pow(0.02, dt));
     u.prevScale = scale;
     u.cool = Math.max(0, u.cool - dt);
 
@@ -674,30 +702,33 @@ const beamMat = new THREE.ShaderMaterial({
 });
 const beamMeshes = [];
 function updateBeams(dt, time) {
+  // Retire dead beams before anything is sized or shown, so a mesh whose beam
+  // expired this frame cannot linger for one frame holding a stale transform.
+  for (let i = beams.length - 1; i >= 0; i--) {
+    beams[i].age += dt;
+    if (beams[i].age > beams[i].life) beams.splice(i, 1);
+  }
   while (beamMeshes.length < beams.length) {
     const m = new THREE.Mesh(beamGeo, beamMat.clone());
     scene.add(m);
     beamMeshes.push(m);
   }
-  beamMeshes.forEach((m, i) => { m.visible = i < beams.length; });
 
-  for (let i = beams.length - 1; i >= 0; i--) {
-    const b = beams[i];
-    b.age += dt;
-    if (b.age > b.life) { beams.splice(i, 1); continue; }
+  beams.forEach((b, i) => {
     const k = b.age / b.life;
     const fade = k < 0.12 ? k / 0.12 : Math.pow(1 - (k - 0.12) / 0.88, 1.5);
     const m = beamMeshes[i];
-    if (!m) continue;
     // the blast travels toward the viewer, so it is drawn along +z
     const len = 14;
+    const girth = (0.12 + b.power * 0.26) * (0.6 + k * 1.6);
     m.position.copy(b.pos).add(new THREE.Vector3(0, 0, len / 2));
     m.rotation.set(Math.PI / 2, 0, 0);
-    m.scale.set((0.12 + b.power * 0.26) * (0.6 + k * 1.6), len, (0.12 + b.power * 0.26) * (0.6 + k * 1.6));
+    m.scale.set(girth, len, girth);
     m.material.uniforms.uTime.value = time;
     m.material.uniforms.uFade.value = fade;
     m.material.uniforms.uPower.value = b.power;
-  }
+  });
+  beamMeshes.forEach((m, i) => { m.visible = i < beams.length; });
 }
 
 // ================================================================
@@ -1038,7 +1069,9 @@ addEventListener('keydown', e => {
   else if (k === 'd') showDebug = !showDebug;
   else if (k === 'r') resetSuit();
   else if (k === 'm') { A.muted = !A.muted; if (A.master) A.master.gain.value = A.muted ? 0 : 0.85; }
-  else if (k === ' ') { e.preventDefault(); startSuitUp(); }
+  // Space re-runs the sequence from wherever it got to, rather than doing
+  // nothing at all once a suit is already on.
+  else if (k === ' ') { e.preventDefault(); if (phase !== 'idle') resetSuit(); startSuitUp(); }
 });
 addEventListener('pointerdown', initAudio);
 soundBtn.addEventListener('click', initAudio);

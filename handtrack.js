@@ -55,7 +55,11 @@ export function bodyFrame(pose) {
   const hip = mid(lh, rh);
   const width = Math.hypot(ls.x - rs.x, ls.y - rs.y);
   const torso = Math.hypot(shoulder.x - hip.x, shoulder.y - hip.y);
-  const roll = Math.atan2(rs.y - ls.y, rs.x - ls.x);
+  // Shoulder tilt, measured right-shoulder → left-shoulder and flipped into
+  // screen terms (image y runs down). Level shoulders read 0. Measuring it the
+  // other way round reads ~π for anyone standing normally, which silently
+  // turned everything hung off this frame upside down.
+  const roll = Math.atan2(-(ls.y - rs.y), ls.x - rs.x);
 
   return {
     shoulder, hip, width, torso, roll,
@@ -205,7 +209,7 @@ const norm3 = v => { const l = len3(v) || 1e-6; return { x: v.x / l, y: v.y / l,
  *              doubles as a confidence measure for the whole reading
  */
 export function orientation(lm, key = 'Right') {
-  const wrist = lm[0], idx = lm[5], pky = lm[17], mid = lm[9];
+  const wrist = lm[0], idx = lm[5], pky = lm[17], knuckle = lm[9];
 
   const v1 = sub(idx, wrist);
   const v2 = sub(pky, wrist);
@@ -223,7 +227,7 @@ export function orientation(lm, key = 'Right') {
   // +z points away from the camera, so a palm aimed at the lens has n.z < 0.
   const facing = -n.z;
 
-  const axis = sub(mid, wrist);
+  const axis = sub(knuckle, wrist);
   const axisLen = Math.hypot(axis.x, axis.y) || 1e-6;
   const uprightness = -axis.y / axisLen;          // y is down, so negate
   const roll = Math.atan2(axis.y, axis.x);
@@ -578,9 +582,11 @@ export async function createTracker(opts = {}) {
   const faceFilter = new LandmarkFilter(478, { minCutoff: 1.4, beta: 0.03 });
   let lastVideoTime = -1, lastT = performance.now(), fpsEMA = 60;
   let callback = () => {};
+  let running = true;
   let raw = [], rawPose = null, rawFace = null, faceMatrix = null;
 
   function step(now) {
+    if (!running) return;
     requestAnimationFrame(step);
     const dt = Math.min((now - lastT) / 1000, 0.05);
     lastT = now;
@@ -658,7 +664,9 @@ export async function createTracker(opts = {}) {
     toNDC(p) {
       return { x: ((state.mirror ? 1 - p.x : p.x) * 2 - 1), y: -(p.y * 2 - 1) };
     },
-    stop() { stream?.getTracks().forEach(t => t.stop()); },
+    // Stop the detection loop too — leaving it running would keep calling
+    // detectForVideo on a video whose track has already ended.
+    stop() { running = false; stream?.getTracks().forEach(t => t.stop()); },
   };
 
   boot.classList.add('gone');

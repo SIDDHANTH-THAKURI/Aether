@@ -123,7 +123,9 @@ class TimeObject {
     this.selected = 0;
   }
   setTime(t) { this.t = THREE.MathUtils.clamp(t, 0, 1); }
-  setSelected(v) { this.selected += (v - this.selected) * 0.2; }
+  setSelected(v, dt = 1 / 60) {
+    this.selected += (v - this.selected) * (1 - Math.pow(0.0002, dt));
+  }
   dispose() {
     this.group.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); });
   }
@@ -264,8 +266,8 @@ export class Candle extends TimeObject {
     super('Candle');
 
     this.waxMat = new THREE.MeshStandardMaterial({
-      color: 0xefe3c8, roughness: 0.55, metalness: 0.0,
-      emissive: 0x2a1405, emissiveIntensity: 1,
+      color: 0xded0b0, roughness: 0.6, metalness: 0.0,
+      emissive: 0x140a03, emissiveIntensity: 1,
     });
     this.body = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.36, 2, 32), this.waxMat);
     this.group.add(this.body);
@@ -291,7 +293,9 @@ export class Candle extends TimeObject {
     this.flame = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.85), this.flameMat);
     this.group.add(this.flame);
 
-    this.light = new THREE.PointLight(0xffa542, 2.2, 8, 2);
+    // Kept deliberately weak: the lamp sits a few centimetres from pale wax, so
+    // inverse-square makes anything stronger blow the candle out to flat white.
+    this.light = new THREE.PointLight(0xffa542, 1.0, 5, 2);
     this.group.add(this.light);
   }
 
@@ -314,10 +318,10 @@ export class Candle extends TimeObject {
     this.flameMat.uniforms.uTime.value = time;
 
     this.light.position.y = -1 + h + 0.3;
-    this.light.intensity = (2.4 - burn * 1.1) * flick;
+    this.light.intensity = (1.1 - burn * 0.45) * flick;
 
     this.waxMat.emissive.setRGB(
-      0.16 + this.selected * 0.0, 0.07 + this.selected * 0.3, 0.02 + this.selected * 0.14);
+      0.05, 0.026 + this.selected * 0.26, 0.008 + this.selected * 0.12);
   }
 }
 

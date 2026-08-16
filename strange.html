@@ -83,7 +83,7 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 import { createTracker, palmCenter, handScale, spread, fingersUp, isFist,
-         Gate, conf, drawHandDebug, bodyFrame } from './handtrack.js';
+         Gate, conf, drawHandDebug } from './handtrack.js';
 import { MagicCircle } from './strange/magic.js';
 import { Portal } from './strange/portal.js';
 import { EyeOfAgamotto } from './strange/eye.js';
@@ -190,7 +190,7 @@ composer.addPass(mainPass);
 
 // threshold near 1 so only genuinely emissive things (runes, portal fire,
 // the stone) bloom — a low threshold here was blowing out the whole scene
-const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.55, 0.45, 0.92);
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.42, 0.45, 0.92);
 composer.addPass(bloom);
 
 // Final grade: chromatic aberration, a temporal ripple while scrubbing, vignette.
@@ -288,7 +288,8 @@ const sparkMat = new THREE.ShaderMaterial({
     void main(){
       vSeed = aSeed; vColor = aColor;
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      gl_PointSize = aSize * (320.0 / max(-mv.z, 0.001));
+      // pixels per unit of aSize at one world unit away — see portal.js
+      gl_PointSize = aSize * (34.0 / max(-mv.z, 0.001));
       gl_Position = projectionMatrix * mv;
     }`,
   fragmentShader: `
@@ -647,11 +648,13 @@ const timeObjects = buildTimeObjects();
 const objectsGroup = new THREE.Group();
 objectsGroup.visible = false;
 scene.add(objectsGroup);
+// Laid out low and set back behind the amulet's depth. Sitting them in front
+// of it put the middle object straight over the wearer's chest, hiding the one
+// thing this mode is about.
 timeObjects.forEach((o, i) => {
   const n = timeObjects.length;
-  o.group.position.set((i - (n - 1) / 2) * 2.1, -0.6, 1.1);
-  o.group.scale.setScalar(0.62);
-  o.time = 0;
+  o.group.position.set((i - (n - 1) / 2) * 2.5, -1.35, -0.2);
+  o.group.scale.setScalar(0.6);
   o.smoothT = 0;
   objectsGroup.add(o.group);
 });
@@ -666,8 +669,12 @@ function updateSpinGesture(hands, dt, time) {
   spinCooldown = Math.max(0, spinCooldown - dt);
   if (hands.length < 2) { spinPrevAngle = null; spinAccum *= Math.pow(0.2, dt); return; }
 
-  const a = tracker.toNDC(palmCenter(hands[0].lm));
-  const b = tracker.toNDC(palmCenter(hands[1].lm));
+  // Ordered by handedness rather than detection order: if the two swapped
+  // places in the array the measured angle would jump by π and the sweep
+  // would either stall or count a turn nobody made.
+  const [h0, h1] = hands[0].key === 'Left' ? [hands[0], hands[1]] : [hands[1], hands[0]];
+  const a = tracker.toNDC(palmCenter(h0.lm));
+  const b = tracker.toNDC(palmCenter(h1.lm));
   const angle = Math.atan2(b.y - a.y, b.x - a.x);
 
   if (spinPrevAngle !== null) {
@@ -711,8 +718,9 @@ function updateEyeMode(hands, dt, time, body) {
     eye.group.position.lerp(target, 1 - Math.pow(0.002, dt));
     const scale = clamp(body.width * worldHeight(0.4) * 1.15, 0.35, 3.2);
     eye.group.scale.setScalar(scale);
-    // mirror flips the apparent roll direction
-    eye.group.rotation.z = (tracker.state.mirror ? 1 : -1) * body.roll;
+    // body.roll is 0 for level shoulders; mirroring reverses which way a lean
+    // reads on screen, so the sign flips with it
+    eye.group.rotation.z = tracker.state.mirror ? -body.roll : body.roll;
   } else {
     // no body yet: park it centre-low so the mode is still usable
     eye.group.visible = true;
@@ -788,7 +796,7 @@ function updateEyeMode(hands, dt, time, body) {
   }
 
   timeObjects.forEach((o, i) => {
-    o.setSelected(i === selected && eye.open > 0.5 ? 1 : 0);
+    o.setSelected(i === selected && eye.open > 0.5 ? 1 : 0, dt);
     o.update(dt, time);
   });
 }
@@ -814,10 +822,23 @@ function setMode(m) {
        <b>H</b> hide &nbsp;·&nbsp; <b>C</b> camera &nbsp;·&nbsp; <b>D</b> debug &nbsp;·&nbsp;
        <b>M</b> mute &nbsp;·&nbsp; <b>Space</b> test`;
 
-  // park whatever the other mode owns
-  portal.group.visible = mode === 'portal' && portal.state !== 'closed';
+  // Tear down whatever the other mode owned. A portal left open is never
+  // updated again once its mode stops running, so it would sit there
+  // invisible-but-open, spilling warm light over a scene it is not part of and
+  // dropping its sparks into the shared buffer.
+  portal.forceClose();
   portalRing.group.visible = false;
   traceCircle.group.visible = false;
+  trace = null;
+  for (const g of twoFingerGates.values()) g.reset();
+  for (const g of traceGates.values()) g.reset();
+  selectGate.reset();
+  spinAccum = 0; spinPrevAngle = null; spinCooldown = 0;
+  sparkData.length = 0;
+  flash = 0; ca = 0;
+  bgMat.uniforms.uWarm.value = 0;
+  bgMat.uniforms.uGreen.value = 0;
+
   eye.group.visible = mode === 'eye';
   handCircle.group.visible = false;
   objectsGroup.visible = mode === 'eye';
@@ -845,13 +866,13 @@ function frame(hands, dt, time, extra) {
     bgMat.uniforms.uMirror.value = tracker.state.mirror ? 1 : 0;
   } else bgMat.uniforms.uHas.value = 0;
 
-  const warmSrc = portal.isOpen ? portal.group.position : null;
-  if (warmSrc) {
-    const s = warmSrc.clone().project(camera);
+  const warmOn = mode === 'portal' && portal.isOpen;
+  if (warmOn) {
+    const s = portal.group.position.clone().project(camera);
     bgMat.uniforms.uWarmPos.value.set(s.x * 0.5 + 0.5, s.y * 0.5 + 0.5);
   }
   bgMat.uniforms.uWarm.value = lerp(bgMat.uniforms.uWarm.value,
-    portal.isOpen ? portal.open * 1.15 : 0, 1 - Math.pow(0.01, dt));
+    warmOn ? portal.open * 1.15 : 0, 1 - Math.pow(0.01, dt));
 
   if (mode === 'eye') {
     const s = eye.group.position.clone().project(camera);
